@@ -338,6 +338,12 @@ void World::AddSession_(WorldSession* s)
     sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "World::AddSession_: AUTH_OK sent to account %u platform=%u",
              s->GetAccountId(), uint32(s->GetPlatform()));
 
+    if (s->GetPlatform() == CLIENT_PLATFORM_X64)
+    {
+        WorldPacket azctProbe(0x1A4, 0);
+        s->SendPacket(&azctProbe);
+    }
+
     // AZRT: do not push CHAR_ENUM here — wait for client's empty opcode 96 poll so the
     // client is in CHAR_LIST_RETRIEVING and ready to accept the response.
 

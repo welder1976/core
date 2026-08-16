@@ -242,9 +242,18 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
         //   0x233 CHAR_DELETE    (u8, success=0x39)
         //   0x3C3 CHAR_RENAME    (u8, then guid+name if 0)
         //   0x216 login-failed / status u8
-        //   0x527 WORLD_ACCESS_STATUS (u8 granted=0, u32 extra) — world enter
         //   0x1A4 AZCT empty probe (skip)
-        // 0x17D / 0xC5 / 0xFA / 0x1FC / 0x2D7 are stubs. 0x1EC after login
+        // 0x527 WORLD_ACCESS_STATUS: u8==0 -> IsWorldAccessRestricted, u32 = unix open-time.
+        // Send u8!=0 so the client still gets the world-access event (map/NPC stream)
+        // without the "opens on August 15" gate. u32=0 skips the countdown.
+        // 0x236 LOGIN_VERIFY_WORLD: patched installer writes handler 0x144950280
+        // (mapId + xyz + orientation). Stock Emberveil never registered it.
+        // 0x96  SMSG_MESSAGECHAT: patched installer writes handler 0x144951190
+        // (u8 type, u32 lang, guid, text — classic MOTD / say layout).
+        // 0x1FC COMPRESSED_UPDATE: patched installer writes handler 0x14494CBE0
+        // (u32 inflatedSize + zlib payload -> update-block parser 0x14486B730).
+        // Stock Emberveil left this slot as stub 0x1410EAF20, so the pawn never spawned.
+        // 0x17D / 0xC5 / 0xFA / 0x2D7 are stubs. 0x1EC after login
         // makes the client send CMSG_AUTH_SESSION (0x1ED) again.
         uint16 sendOp = op;
 
@@ -260,26 +269,6 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
         WorldPacket sendPacket;
         if (op == SMSG_COMPRESSED_UPDATE_OBJECT || op == SMSG_UPDATE_OBJECT)
         {
-            if (!m_azrtSendingSelfCreate && !m_azrtSelfCreateSent && GetPlayer())
-            {
-                m_azrtSelfCreateSent = true;
-                m_azrtSendingSelfCreate = true;
-                UpdateData selfData;
-                GetPlayer()->Unit::BuildCreateUpdateBlockForPlayer(selfData, GetPlayer());
-                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                         "WorldSession: AZRT inject player-only self-create guid=%u display=%u native=%u race=%u class=%u gender=%u bytes0=0x%X before mixed update size=%u",
-                         GetPlayer()->GetGUIDLow(),
-                         GetPlayer()->GetDisplayId(),
-                         GetPlayer()->GetNativeDisplayId(),
-                         uint32(GetPlayer()->GetRace()),
-                         uint32(GetPlayer()->GetClass()),
-                         uint32(GetPlayer()->GetGender()),
-                         GetPlayer()->GetUInt32Value(UNIT_FIELD_BYTES_0),
-                         uint32(packet->size()));
-                selfData.Send(this, false);
-                m_azrtSendingSelfCreate = false;
-            }
-
             sendOp = 0x1FC;
             if (op == SMSG_COMPRESSED_UPDATE_OBJECT)
             {
@@ -309,11 +298,21 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
         }
         else if (op == SMSG_LOGIN_VERIFY_WORLD)
         {
-            uint32 mapId = packet->size() >= 4 ? packet->read<uint32>(0) : 0u;
-            sendOp = 0x527; // WORLD_ACCESS_STATUS: u8=0 granted, u32 extra
-            sendPacket.Initialize(sendOp, 5);
-            sendPacket << uint8(0);
-            sendPacket << uint32(mapId);
+            // Lift the date-gate first; 0x236 alone does not start the map stream.
+            WorldPacket access(0x527, 5);
+            access << uint8(1); // not restricted
+            access << uint32(0);
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                     "WorldSession: AZRT SMSG WORLD_ACCESS wire=0x527 size=5 account=%u body: 01 00 00 00 00",
+                     GetAccountId());
+            if (m_sniffFile)
+                m_sniffFile->WritePacket(access, false, time(nullptr));
+            m_socket->SendPacket(access);
+
+            // Classic 20-byte VERIFY (map + xyz + o) on 0x236 -> 0x144950280.
+            sendOp = 0x236;
+            sendPacket = WorldPacket(*packet);
+            sendPacket.SetOpcode(sendOp);
         }
         else
         {
@@ -326,8 +325,26 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                 sendOp = 0x3C3;
             else if (op == SMSG_CHARACTER_LOGIN_FAILED)
                 sendOp = 0x216;
-            // 0x1EE AUTH_RESPONSE and 0x478 CHAR_ENUM already use live opcodes.
             sendPacket.SetOpcode(sendOp);
+        }
+
+        bool const allowSmsg = (sendOp == 0x1EE || sendOp == 0x478 || sendOp == 0x232 ||
+                                sendOp == 0x233 || sendOp == 0x3C3 || sendOp == 0x216 ||
+                                sendOp == 0x1EC || sendOp == 0x527 || sendOp == 0x236 ||
+                                sendOp == 0x96 ||
+                                (sendOp == 0x1A4 && sendPacket.empty()) ||
+                                sendOp == 0x1FC ||
+                                op == SMSG_CREATURE_QUERY_RESPONSE ||
+                                op == SMSG_GAMEOBJECT_QUERY_RESPONSE ||
+                                op == SMSG_NAME_QUERY_RESPONSE ||
+                                op == SMSG_ITEM_QUERY_SINGLE_RESPONSE);
+        if (!allowSmsg)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                     "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X/%s) wire=%u (0x%X) size=%u (not in live table)",
+                     uint32(op), uint32(op), LookupOpcodeName(op),
+                     uint32(sendOp), uint32(sendOp), uint32(sendPacket.size()));
+            return;
         }
 
         if (sendOp != op)
@@ -341,7 +358,8 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
         if ((sendOp != 0x1FC && (!GetPlayer() || sendPacket.size() <= 64)) ||
             op == SMSG_AUTH_RESPONSE || op == SMSG_LOGIN_VERIFY_WORLD ||
             op == SMSG_CHAR_ENUM || op == SMSG_CHAR_CREATE || op == SMSG_CHAR_DELETE ||
-            sendOp == 0x478 || sendOp == 0x527 || sendOp == 0x232 || sendOp == 0x233)
+            op == SMSG_MESSAGECHAT ||
+            sendOp == 0x478 || sendOp == 0x527 || sendOp == 0x236 || sendOp == 0x232 || sendOp == 0x233)
         {
             char const* name = LookupOpcodeName(op);
             size_t const n = std::min<size_t>(sendPacket.size(), 256);
