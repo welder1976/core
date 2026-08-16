@@ -197,15 +197,18 @@ void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
         MarkAzrtCharEnumFullSent();
 
         // Emberveil lich=0: after the vanilla enum body the client requires 32 more
-        // bytes (AZCT slot-1 AES key). Remaining < 32 => "Character list is incomplete."
+        // bytes (AZCT slot-1 AES key, different from A1 slot-0). Remaining < 32
+        // or a bad key => "Character list is incomplete."
         uint8 azrtEnumKey[32] = {};
-        std::string keyHex = sConfig.GetStringDefault("Azrt.IntegrityKey", "");
+        std::string keyHex = sConfig.GetStringDefault("Azrt.CharEnumKey", "");
         if (keyHex.size() == 64)
             HexStrToByteArray(keyHex, azrtEnumKey);
         else if (!keyHex.empty())
             sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
-                     "SMSG_CHAR_ENUM Azrt.IntegrityKey must be 64 hex chars, got %u",
+                     "SMSG_CHAR_ENUM Azrt.CharEnumKey must be 64 hex chars, got %u",
                      uint32(keyHex.size()));
+        else
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "SMSG_CHAR_ENUM Azrt.CharEnumKey is empty");
         data.append(azrtEnumKey, sizeof(azrtEnumKey));
     }
 
