@@ -227,6 +227,8 @@ class WorldSession
         void SetOS(ClientOSType os) { m_clientOS = os; }
         ClientPlatformType GetPlatform() const { return m_clientPlatform; }
         void SetPlatform(ClientPlatformType platform) { m_clientPlatform = platform; }
+        bool HasAzrtCharEnumFullBeenSent() const { return m_azrtCharEnumFullSent; }
+        void MarkAzrtCharEnumFullSent() { m_azrtCharEnumFullSent = true; }
         uint32 GetDialogStatus(Player* pPlayer, Object* questgiver, uint32 defstatus);
         uint32 GetAccountMaxLevel() const { return m_characterMaxLevel; }
         void SetAccountFlags(uint32 f) { m_accountFlags = f; }
@@ -872,6 +874,10 @@ class WorldSession
         int m_sessionDbLocaleIndex;
         ClientOSType m_clientOS;
         ClientPlatformType m_clientPlatform;
+        bool m_azrtCharEnumFullSent = false;
+        bool m_azrtSelfCreateSent = false;
+        bool m_azrtSendingSelfCreate = false;
+        bool m_azrtCinematicStopSent = false;
         uint32 m_gameBuild;
         bool m_verifiedEmail;
         std::shared_ptr<PlayerBotEntry> m_bot;

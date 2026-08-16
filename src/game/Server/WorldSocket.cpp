@@ -30,6 +30,9 @@
 #include "SharedDefines.h"
 #include "AddonHandler.h"
 #include "Opcodes.h"
+#include "Packet.h"
+#include "ClientDefines.h"
+#include "Packets/Query.h"
 #include "Crypto/Hash/SHA1.h"
 #include "Database/SqlPreparedStatement.h"
 #include "Database/DatabaseEnv.h"
@@ -38,11 +41,117 @@
 #include "Util.h"
 #include "Errors.h"
 #include "Utilities/Random.h"
+#include "ObjectMgr.h"
+#include "ObjectGuid.h"
 
 #include "IO/Networking/DNS.h"
 #include "IO/Timer/AsyncSystemTimer.h"
 
 #include <memory>
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+namespace
+{
+std::string AzrtPacketBodyHex(WorldPacket const& packet, size_t maxBytes = 256)
+{
+    size_t const n = std::min(packet.size(), maxBytes);
+    std::string hex;
+    hex.reserve(n * 3 + 8);
+    for (size_t i = 0; i < n; ++i)
+    {
+        char b[4];
+        std::snprintf(b, sizeof(b), "%02X ", packet[i]);
+        hex += b;
+    }
+    if (packet.size() > maxBytes)
+        hex += "...";
+    return hex;
+}
+
+uint16 AzrtMapQueryOpcodeByEntry(uint32 entry)
+{
+    if (sObjectMgr.GetCreatureTemplate(entry))
+        return CMSG_CREATURE_QUERY;
+    if (sObjectMgr.GetGameObjectTemplate(entry))
+        return CMSG_GAMEOBJECT_QUERY;
+    return CMSG_ITEM_QUERY_SINGLE;
+}
+
+// Emberveil in-world CMSG remaps. Returns false to drop the packet.
+bool AzrtRemapInWorldCmsg(WorldPacket& packet)
+{
+    uint16 const opcode = packet.GetOpcode();
+
+    // Packed-looking 8-byte GUID: name/creature/GO query (HIGHGUID in last 2 bytes).
+    if (opcode == 0x4FB && packet.size() == 8)
+    {
+        ObjectGuid guid;
+        packet >> guid;
+        if (guid.IsCreatureOrPet())
+        {
+            uint32 const entry = guid.GetEntry();
+            packet.Initialize(CMSG_CREATURE_QUERY, 12);
+            packet << entry << guid;
+            packet.rpos(0);
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                     "WorldSocket: AZRT 0x4FB -> CMSG_CREATURE_QUERY entry=%u guid=%s",
+                     entry, guid.GetString().c_str());
+            return true;
+        }
+        if (guid.IsGameObject() || guid.IsMOTransport() || guid.IsTransport())
+        {
+            packet.Initialize(CMSG_GAMEOBJECT_QUERY, 12);
+            packet << guid.GetEntry() << guid;
+            packet.rpos(0);
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                     "WorldSocket: AZRT 0x4FB -> CMSG_GAMEOBJECT_QUERY entry=%u",
+                     guid.GetEntry());
+            return true;
+        }
+        if (guid.IsPlayer())
+        {
+            packet.Initialize(CMSG_NAME_QUERY, 8);
+            packet << guid;
+            packet.rpos(0);
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                     "WorldSocket: AZRT 0x4FB -> CMSG_NAME_QUERY guid=%u",
+                     guid.GetCounter());
+            return true;
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                 "WorldSocket: AZRT DROP_CMSG 0x4FB unknown guid %s",
+                 guid.GetString().c_str());
+        return false;
+    }
+
+    // entry + guid (12 bytes): creature / GO / item query.
+    if ((opcode == 0x5D || opcode == 0x143 || opcode == 0xDE) && packet.size() >= 4)
+    {
+        uint32 entry = 0;
+        memcpy(&entry, packet.contents(), sizeof(entry));
+        uint16 const mapped = AzrtMapQueryOpcodeByEntry(entry);
+        packet.SetOpcode(mapped);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                 "WorldSocket: AZRT 0x%X -> %s entry=%u",
+                 uint32(opcode), LookupOpcodeName(mapped), entry);
+        return true;
+    }
+
+    if (opcode == 0x11 && packet.size() == 8)
+    {
+        packet.SetOpcode(CMSG_SET_ACTIVE_MOVER);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                 "WorldSocket: AZRT 0x11 -> CMSG_SET_ACTIVE_MOVER");
+        return true;
+    }
+
+    return true;
+}
+} // namespace
 
 #if defined( __GNUC__ )
 #pragma pack(1)
@@ -109,12 +218,28 @@ void WorldSocket::DoRecvIncomingData()
         }
 
         // thread safe due to always being called from service context
+        uint8 rawHeader[sizeof(ClientPktHeader)];
+        memcpy(rawHeader, header.get(), sizeof(ClientPktHeader));
         self->m_Crypt.DecryptRecv((uint8*)header.get(), sizeof(ClientPktHeader));
+
+        if (self->m_Session && self->m_Session->GetPlatform() == CLIENT_PLATFORM_X64)
+        {
+            // Header dump is extremely noisy during char-list poll; keep it at DETAIL.
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                     "WorldSocket header raw=%02X%02X%02X%02X%02X%02X dec=%02X%02X%02X%02X%02X%02X crypt=%u",
+                     rawHeader[0], rawHeader[1], rawHeader[2], rawHeader[3], rawHeader[4], rawHeader[5],
+                     ((uint8*)header.get())[0], ((uint8*)header.get())[1], ((uint8*)header.get())[2],
+                     ((uint8*)header.get())[3], ((uint8*)header.get())[4], ((uint8*)header.get())[5],
+                     self->m_Crypt.IsInitialized() ? 1 : 0);
+        }
 
         EndianConvertReverse(header->size);
         EndianConvert(header->cmd);
 
-        if ((header->size < 4) || (header->size > 0x2800) || IsDefinitelyBogusOpcode(header->cmd))
+        // Emberveil uses opcodes above classic NUM_MSG_TYPES (e.g. 0x4EE char-select).
+        bool const azrtSession = self->m_Session && self->m_Session->GetPlatform() == CLIENT_PLATFORM_X64;
+        bool const bogusClassic = !azrtSession && IsDefinitelyBogusOpcode(static_cast<uint16>(header->cmd));
+        if ((header->size < 4) || (header->size > 0x2800) || bogusClassic)
         {
             sLog.Out(LOG_NETWORK, LOG_LVL_BASIC, "[%s] WorldSocket::DoRecvIncomingData: client sent malformed packet size = %u, cmd = %u", self->m_socket.GetRemoteIpString().c_str(), header->size, header->cmd);
             self->CloseSocket(); // We don't want to receive any more packets from this client
@@ -153,6 +278,7 @@ void WorldSocket::DoRecvIncomingData()
 
 WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::unique_ptr<WorldPacket> packet)
 {
+    // Keep full opcode for AZRT (may be > 0xFFFF classic range conceptually; stored as uint16 in WorldPacket).
     uint16 const opcode = packet->GetOpcode();
 
     if (IsClosing())
@@ -173,15 +299,149 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                     return HandlerResult::Fail;
                 }
                 return _HandleAuthSession(*packet);
-            default:
-                if (m_Session == nullptr)
+                default:
                 {
-                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WorldSocket::ProcessIncoming: Client not authed opcode = %u", uint32(opcode));
-                    return HandlerResult::Fail;
-                }
+                    if (m_Session == nullptr)
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WorldSocket::ProcessIncoming: Client not authed opcode = %u", uint32(opcode));
+                        return HandlerResult::Fail;
+                    }
 
-                m_Session->QueueBinaryPacket(std::move(packet));
-                return HandlerResult::Okay;
+                    // AZRT/x64: always log what the client asks for (opcode + body).
+                    if (m_Session->GetPlatform() == CLIENT_PLATFORM_X64)
+                    {
+                        char const* name = LookupOpcodeName(opcode);
+                        bool const preLogin = !m_Session->GetPlayer();
+                        bool const querySpam = (opcode == 0x4FB || opcode == 0x5D ||
+                                                opcode == 0x143 || opcode == 0xDE);
+                        sLog.Out(LOG_BASIC, querySpam ? LOG_LVL_DETAIL : LOG_LVL_BASIC,
+                                 "WorldSocket: AZRT CMSG opcode=%u (0x%X) name=%s size=%u preLogin=%u account=%u body[%u]: %s",
+                                 uint32(opcode), uint32(opcode), name ? name : "?",
+                                 uint32(packet->size()), preLogin ? 1u : 0u, m_Session->GetAccountId(),
+                                 uint32(packet->size()),
+                                 packet->empty() ? "(empty)" : AzrtPacketBodyHex(*packet).c_str());
+                    }
+                    else
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL, "WorldSocket: recv opcode=%u (%s) size=%u account=%u",
+                                 uint32(opcode), LookupOpcodeName(opcode), uint32(packet->size()), m_Session->GetAccountId());
+                    }
+
+                    // Emberveil C->S opcode map (UOA + RE):
+                    //   0x060 -> CMSG_CHAR_ENUM (0x37)
+                    //   0x111 -> CMSG_PING (0x1DC)  — NOT player login
+                    //   0x299 -> CMSG_CHAR_CREATE (0x36)
+                    //   0x221 -> CMSG_CHAR_DELETE (0x38)
+                    //   0x4EE -> CMSG_PLAYER_LOGIN — u64 guid + CString locale (e.g. "ru-RU")
+                    // S->C char list: 0x478 (client handler table), not vanilla 0x3B / not 0x271.
+                    if (m_Session->GetPlatform() == CLIENT_PLATFORM_X64)
+                    {
+                        if (opcode == 0x60 && packet->size() == 0)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "WorldSocket: AZRT 0x60 -> CMSG_CHAR_ENUM");
+                            m_Session->HandleCharEnumOpcode(NullClientPacket(CMSG_CHAR_ENUM));
+                            return HandlerResult::Okay;
+                        }
+
+                        if (opcode == 0x111 && packet->size() == 8)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "WorldSocket: AZRT 0x111 -> CMSG_PING");
+                            packet->SetOpcode(CMSG_PING);
+                            return _HandlePing(*packet);
+                        }
+
+                        // Enter-world: guid + locale. Dropping this left the client in free-fly
+                        // with no spawned player (local scene without LOGIN_VERIFY / updates).
+                        if (opcode == 0x4EE && packet->size() >= 8)
+                        {
+                            uint32 const pktSize = uint32(packet->size());
+                            ObjectGuid guid;
+                            *packet >> guid;
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "WorldSocket: AZRT 0x4EE -> CMSG_PLAYER_LOGIN guid=%u size=%u",
+                                     guid.GetCounter(), pktSize);
+                            if (guid.IsPlayer())
+                                m_Session->LoginPlayer(guid);
+                            return HandlerResult::Okay;
+                        }
+
+                        if (opcode == 0x299)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "WorldSocket: AZRT 0x299 -> CMSG_CHAR_CREATE size=%u",
+                                     uint32(packet->size()));
+                            packet->SetOpcode(CMSG_CHAR_CREATE);
+                        }
+                        else if (opcode == 0x221)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "WorldSocket: AZRT 0x221 -> CMSG_CHAR_DELETE size=%u",
+                                     uint32(packet->size()));
+                            packet->SetOpcode(CMSG_CHAR_DELETE);
+                        }
+                        else if (m_Session->GetPlayer() &&
+                                 (opcode == 0x4FB || opcode == 0x5D || opcode == 0x143 ||
+                                  opcode == 0xDE || opcode == 0x11))
+                        {
+                            if (!AzrtRemapInWorldCmsg(*packet))
+                                return HandlerResult::Okay;
+                        }
+                        else if (!m_Session->GetPlayer() && opcode != CMSG_PING &&
+                                 opcode != CMSG_CHAR_CREATE && opcode != CMSG_CHAR_DELETE &&
+                                 opcode != CMSG_PLAYER_LOGIN)
+                        {
+                            // Unmapped AZRT pre-login opcodes (>=0x300 etc.) — drop, never kick.
+                            if (opcode >= 0x300)
+                            {
+                                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                         "WorldSocket: AZRT action=DROP_PRELOGIN opcode=%u (0x%X)",
+                                         uint32(opcode), uint32(opcode));
+                                return HandlerResult::Okay;
+                            }
+                        }
+                    }
+
+                    // AZRT/x64 pre-login: drop remaining colliding/unknown opcodes; never kick.
+                    if (m_Session->GetPlatform() == CLIENT_PLATFORM_X64 && !m_Session->GetPlayer())
+                    {
+                        uint16 const op = packet->GetOpcode();
+                        if (op != CMSG_PING && op != CMSG_CHAR_CREATE && op != CMSG_CHAR_DELETE &&
+                            op != CMSG_CHAR_ENUM && op != CMSG_PLAYER_LOGIN)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "WorldSocket: AZRT action=DROP_PRELOGIN opcode=%u (0x%X)",
+                                     uint32(op), uint32(op));
+                            return HandlerResult::Okay;
+                        }
+                    }
+
+                    // AZRT in-world: unknown opcodes are not classic handlers — drop, don't ERROR-spam.
+                    if (m_Session->GetPlatform() == CLIENT_PLATFORM_X64)
+                    {
+                        OpcodeHandler const& h = LookupOpcodeHandler(packet->GetOpcode());
+                        if (!h.impl.has_value())
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                                     "WorldSocket: AZRT DROP_CMSG opcode=%u (0x%X) size=%u (no handler)",
+                                     uint32(packet->GetOpcode()), uint32(packet->GetOpcode()),
+                                     uint32(packet->size()));
+                            return HandlerResult::Okay;
+                        }
+                    }
+
+                    try
+                    {
+                        m_Session->QueueBinaryPacket(std::move(packet));
+                    }
+                    catch (ByteBufferException&)
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WorldSocket: skipped malformed opcode=%u size parse failure from %s account=%u",
+                                 uint32(opcode), GetRemoteIpString().c_str(), m_Session->GetAccountId());
+                    }
+                    return HandlerResult::Okay;
+                }
         }
     }
     catch (ByteBufferException&)
@@ -409,6 +669,8 @@ WorldSocket::HandlerResult WorldSocket::_HandleAuthSession(WorldPacket& recvPack
     ClientPlatformType clientPlatform;
     if (platform == "x86")
         clientPlatform = CLIENT_PLATFORM_X86;
+    else if (platform == "x64") // Unreal Azeroth / Emberveil (AZRT)
+        clientPlatform = CLIENT_PLATFORM_X64;
     else if (platform == "PPC" && clientOs == CLIENT_OS_MAC)
         clientPlatform = CLIENT_PLATFORM_PPC;
     else
@@ -416,6 +678,9 @@ WorldSocket::HandlerResult WorldSocket::_HandleAuthSession(WorldPacket& recvPack
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WorldSocket::HandleAuthSession: Unrecognized Platform '%s' for account '%s' from %s", platform.c_str(), account.c_str(), address.c_str());
         return HandlerResult::Fail;
     }
+
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "WorldSocket::HandleAuthSession: account='%s' id=%u build=%u os=%s platform=%s",
+             account.c_str(), accountId, clientBuild, os.c_str(), platform.c_str());
 
 
     // ===== Auth was successful =====
@@ -443,9 +708,17 @@ WorldSocket::HandlerResult WorldSocket::_HandleAuthSession(WorldPacket& recvPack
 
     sWorld.AddSession(m_Session);
 
-    // Create and send the Addon packet
-    if (sAddOnHandler.BuildAddonPacket(&recvPacket, &addonPacket))
-        SendPacket(addonPacket);
+    // Emberveil has no classic addon handshake; sending SMSG_ADDON_INFO before AUTH_OK
+    // desyncs its decrypt stream and character list never appears.
+    if (clientPlatform != CLIENT_PLATFORM_X64)
+    {
+        if (sAddOnHandler.BuildAddonPacket(&recvPacket, &addonPacket))
+            SendPacket(addonPacket);
+    }
+    else
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "WorldSocket::HandleAuthSession: skipping addon packet for AZRT/x64");
+    }
 
     return HandlerResult::Okay;
 }

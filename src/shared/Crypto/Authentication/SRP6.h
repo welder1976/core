@@ -103,10 +103,18 @@ class SRP6
         BigNumber GetSalt(void) { return s; };
         BigNumber GetStrongSessionKey(void) { return K; };
         BigNumber GetVerifier(void) { return v; };
+        BigNumber GetSessionKeyS(void) { return S; };
+        BigNumber GetPrivateEphemeral(void) { return b; };
 
         bool SetSalt(const char* new_s);
         void SetStrongSessionKey(const char* new_K) { K.SetHexStr(new_K); };
         bool SetVerifier(const char* new_v);
+        //! Replace N/g (used by Emberveil AZRT which is not classic WoW SRP-6)
+        bool SetParameters(char const* primeHex, uint32 generator);
+        //! Use SRP-6a k=H(N|g) instead of WoW's constant k=3 (needed for AZRT)
+        void SetUseSrp6aMultiplier(bool enable) { m_useSrp6aK = enable; }
+        //! When >0, hash N/g/A/B as fixed-width LE byte arrays (AZRT uses 32)
+        void SetHashPadBytes(int pad) { m_hashPadBytes = pad; }
 
     private:
         BigNumber A, u, S;
@@ -114,5 +122,7 @@ class SRP6
         BigNumber b, B;
         BigNumber K;
         BigNumber M;
+        bool m_useSrp6aK = false;
+        int m_hashPadBytes = 0;
 };
 #endif

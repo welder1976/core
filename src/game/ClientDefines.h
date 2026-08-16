@@ -28,7 +28,8 @@ enum ClientPlatformType
 {
     CLIENT_PLATFORM_UNKNOWN,
     CLIENT_PLATFORM_X86,
-    CLIENT_PLATFORM_PPC
+    CLIENT_PLATFORM_PPC,
+    CLIENT_PLATFORM_X64 // Unreal Azeroth / Emberveil (AZRT)
 };
 
 #endif

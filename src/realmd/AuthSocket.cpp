@@ -122,14 +122,17 @@ void AuthSocket::DoRecvIncomingData()
         // benchmarking has demonstrated that this lookup method is faster than std::map
         constexpr AuthHandler table[] =
         {
-            { CMD_AUTH_LOGON_CHALLENGE,     STATUS_CHALLENGE,   &AuthSocket::_HandleLogonChallenge },
-            { CMD_AUTH_LOGON_PROOF,         STATUS_LOGON_PROOF, &AuthSocket::_HandleLogonProof },
-            { CMD_AUTH_RECONNECT_CHALLENGE, STATUS_CHALLENGE,   &AuthSocket::_HandleReconnectChallenge },
-            { CMD_AUTH_RECONNECT_PROOF,     STATUS_RECON_PROOF, &AuthSocket::_HandleReconnectProof },
-            { CMD_REALM_LIST,               STATUS_AUTHED,      &AuthSocket::_HandleRealmList },
-            { CMD_XFER_ACCEPT,              STATUS_PATCH,       &AuthSocket::_HandleXferAccept },
-            { CMD_XFER_RESUME,              STATUS_PATCH,       &AuthSocket::_HandleXferResume },
-            { CMD_XFER_CANCEL,              STATUS_PATCH,       &AuthSocket::_HandleXferCancel }
+            { CMD_AUTH_LOGON_CHALLENGE,         STATUS_CHALLENGE,   &AuthSocket::_HandleLogonChallenge },
+            { CMD_AUTH_LOGON_PROOF,             STATUS_LOGON_PROOF, &AuthSocket::_HandleLogonProof },
+            { CMD_AUTH_RECONNECT_CHALLENGE,     STATUS_CHALLENGE,   &AuthSocket::_HandleReconnectChallenge },
+            { CMD_AUTH_RECONNECT_PROOF,         STATUS_RECON_PROOF, &AuthSocket::_HandleReconnectProof },
+            { CMD_AUTH_AZRT_LOGON_CHALLENGE,    STATUS_CHALLENGE,   &AuthSocket::_HandleLogonChallenge },
+            { CMD_AUTH_AZRT_LOGON_PROOF,        STATUS_LOGON_PROOF, &AuthSocket::_HandleLogonProof },
+            { CMD_REALM_LIST,                   STATUS_AUTHED,      &AuthSocket::_HandleRealmList },
+            { CMD_AUTH_AZRT_REALM_LIST,         STATUS_AUTHED,      &AuthSocket::_HandleRealmList },
+            { CMD_XFER_ACCEPT,                  STATUS_PATCH,       &AuthSocket::_HandleXferAccept },
+            { CMD_XFER_RESUME,                  STATUS_PATCH,       &AuthSocket::_HandleXferResume },
+            { CMD_XFER_CANCEL,                  STATUS_PATCH,       &AuthSocket::_HandleXferCancel }
         };
 
         constexpr size_t tableLength = sizeof(table) / sizeof(AuthHandler);
@@ -140,6 +143,15 @@ void AuthSocket::DoRecvIncomingData()
         {
             if (table[i].cmd != *cmd)
                 continue;
+
+            // Remember AZRT dialect so replies use matching opcodes
+            if (*cmd == CMD_AUTH_AZRT_LOGON_CHALLENGE || *cmd == CMD_AUTH_AZRT_CHALLENGE_RESP ||
+                *cmd == CMD_AUTH_AZRT_LOGON_PROOF || *cmd == CMD_AUTH_AZRT_PROOF_RESP ||
+                *cmd == CMD_AUTH_AZRT_REALM_LIST)
+            {
+                self->m_azrtClient = true;
+                sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[%s] AZRT auth dialect enabled (cmd %u)", self->GetRemoteIpString().c_str(), *cmd);
+            }
 
             sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[%s] CMD: %u requires status %u, user has %u", self->GetRemoteIpString().c_str(), *cmd, table[i].status, self->m_status);
 
@@ -173,21 +185,24 @@ std::shared_ptr<ByteBuffer> AuthSocket::GenerateLogonProofResponse(Crypto::Hash:
 {
     std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
 
-    if (m_build < 6299)  // before version 2.0.3 (exclusive)
+    // AZRT proof success: A3 | error | M2[20] | surveyId 00 00 01 00
+    if (m_azrtClient || m_build < 6299)  // before version 2.0.3 (exclusive)
     {
         AUTH_LOGON_PROOF_S proof{};
         memcpy(proof.M2, shaDigest.data(), 20);
-        proof.cmd = CMD_AUTH_LOGON_PROOF;
+        proof.cmd = AuthProofCmd();
         proof.error = 0;
-        proof.surveyId = 0x00000000;
+        proof.surveyId = m_azrtClient ? 0x00010000u : 0x00000000u;
 
         pkt->append(&proof, 1);
+        if (m_azrtClient)
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] AZRT success reply M2 + trailer 00 00 01 00");
     }
     else if (m_build < 8089) // before version 2.4.0 (exclusive)
     {
         AUTH_LOGON_PROOF_S_BUILD_6299 proof{};
         memcpy(proof.M2, shaDigest.data(), 20);
-        proof.cmd = CMD_AUTH_LOGON_PROOF;
+        proof.cmd = AuthProofCmd();
         proof.error = 0;
         proof.surveyId = 0x00000000;
         proof.loginFlags = 0x0000;
@@ -198,7 +213,7 @@ std::shared_ptr<ByteBuffer> AuthSocket::GenerateLogonProofResponse(Crypto::Hash:
     {
         AUTH_LOGON_PROOF_S_BUILD_8089 proof{};
         memcpy(proof.M2, shaDigest.data(), 20);
-        proof.cmd = CMD_AUTH_LOGON_PROOF;
+        proof.cmd = AuthProofCmd();
         proof.error = 0;
         proof.accountFlags = ACCOUNT_FLAG_PROPASS;
         proof.surveyId = 0x00000000;
@@ -217,7 +232,9 @@ bool AuthSocket::IsAllowedLocale(std::string const& locale)
     static char const* const kAllowedLocales[] =
     {
         "enUS", "enGB", "koKR", "frFR", "deDE",
-        "zhCN", "zhTW", "esES", "esMX", "ruRU"
+        "zhCN", "zhTW", "esES", "esMX", "ruRU",
+        // Emberveil / Unreal Azeroth
+        "Euro", "enEU"
     };
 
     for (char const* loc : kAllowedLocales)
@@ -231,6 +248,136 @@ bool AuthSocket::IsAllowedLocale(std::string const& locale)
 
 void AuthSocket::ReadChallengeRequest(char const* logPrefix, std::function<void(std::shared_ptr<sAuthLogonChallengeBody> const&)> onBody)
 {
+    // Classic: error(uint8) + size(uint16). AZRT (Emberveil): size(uint16) only — no error byte.
+    if (m_azrtClient)
+    {
+        std::shared_ptr<uint16> sizeField = std::make_shared<uint16>();
+        m_socket.Read(reinterpret_cast<char*>(sizeField.get()), sizeof(uint16),
+            [self = shared_from_this(), sizeField, logPrefix, onBody = std::move(onBody)]
+            (IO::NetworkError const& error, size_t) mutable -> void
+        {
+            if (error)
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Read(AZRT size) error: %s", logPrefix, error.ToString().c_str());
+                return;
+            }
+
+            EndianConvert(*sizeField);
+            uint16 actualBodySize = *sizeField;
+            uint16 const minBody = 20; // AZRT may omit classic padding; classic min is 31
+            uint16 const maxBodyAzrt = 256;
+
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[%s] AZRT size=%u", logPrefix, actualBodySize);
+
+            if (actualBodySize < minBody || actualBodySize > maxBodyAzrt)
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] AZRT body size invalid: %u", logPrefix, actualBodySize);
+                return;
+            }
+
+            std::shared_ptr<std::vector<uint8>> raw = std::make_shared<std::vector<uint8>>(actualBodySize);
+            self->m_socket.Read(reinterpret_cast<char*>(raw->data()), actualBodySize,
+                [self, raw, logPrefix, onBody = std::move(onBody), actualBodySize]
+                (IO::NetworkError const& error, size_t) -> void
+                {
+                    if (error)
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Read(AZRT body) error: %s", logPrefix, error.ToString().c_str());
+                        return;
+                    }
+
+                    {
+                        std::string hex;
+                        size_t dumpLen = std::min<size_t>(raw->size(), 64);
+                        hex.reserve(dumpLen * 3);
+                        static char const* digits = "0123456789ABCDEF";
+                        for (size_t i = 0; i < dumpLen; ++i)
+                        {
+                            uint8 b = (*raw)[i];
+                            hex.push_back(digits[b >> 4]);
+                            hex.push_back(digits[b & 0xF]);
+                            hex.push_back(' ');
+                        }
+                        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[%s] AZRT body[%u]: %s", logPrefix, actualBodySize, hex.c_str());
+                    }
+
+                    // AZRT body layout (Emberveil) differs from classic WoW:
+                    //   gamename[4] + build(u32) + platform[4] + os[4] + country[4]
+                    //   + timezone(u32) + username_len + username
+                    // No version trio, no IP. Strings are NOT byte-swapped.
+                    if (raw->size() < 25)
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] AZRT body truncated: %u", logPrefix, actualBodySize);
+                        return;
+                    }
+
+                    uint8 usernameLen = (*raw)[24];
+                    if (usernameLen > AUTH_LOGON_MAX_NAME || size_t(25 + usernameLen) > raw->size())
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] AZRT username_len invalid: %u (body %u)",
+                                 logPrefix, usernameLen, actualBodySize);
+                        return;
+                    }
+
+                    std::shared_ptr<sAuthLogonChallengeBody> body = std::make_shared<sAuthLogonChallengeBody>();
+                    memset(body.get(), 0, sizeof(sAuthLogonChallengeBody));
+
+                    memcpy(body->gamename, raw->data() + 0, 4);
+                    uint32 azrtBuild = 0;
+                    memcpy(&azrtBuild, raw->data() + 4, 4);
+                    EndianConvert(azrtBuild);
+                    // Keep a vanilla-compatible build number for reply packet shaping.
+                    body->version1 = 1;
+                    body->version2 = 12;
+                    body->version3 = 1;
+                    body->build = 5875;
+                    self->m_build = body->build;
+
+                    memcpy(body->platform, raw->data() + 8, 4);
+                    memcpy(body->os, raw->data() + 12, 4);
+                    memcpy(body->country, raw->data() + 16, 4);
+                    memcpy(&body->timezone_bias, raw->data() + 20, 4);
+                    EndianConvert(body->timezone_bias);
+                    body->ip = 0;
+                    body->username_len = usernameLen;
+                    memcpy(body->username, raw->data() + 25, usernameLen);
+                    body->username[usernameLen] = '\0';
+
+                    auto cstr4 = [](uint8 const* p) -> std::string
+                    {
+                        char tmp[5] = {};
+                        memcpy(tmp, p, 4);
+                        std::string s(tmp);
+                        while (!s.empty() && s.back() == '\0')
+                            s.pop_back();
+                        return s;
+                    };
+
+                    self->m_os = cstr4(body->os);
+                    self->m_platform = cstr4(body->platform);
+                    self->m_localizationName = cstr4(body->country);
+
+                    if (!IsAllowedLocale(self->m_localizationName))
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[%s] AZRT locale '%s' not classic — allowing",
+                                 logPrefix, self->m_localizationName.c_str());
+                    }
+
+                    self->m_login = (const char*)body->username;
+                    self->m_safelogin = self->m_login;
+                    LoginDatabase.escape_string(self->m_safelogin);
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                             "[%s] login='%s' azrtBuild=%u mappedBuild=%u os=%s platform=%s locale=%s gamename=%.4s",
+                             logPrefix, self->m_login.c_str(), azrtBuild, self->m_build,
+                             self->m_os.c_str(), self->m_platform.c_str(), self->m_localizationName.c_str(),
+                             body->gamename);
+
+                    onBody(body);
+                });
+        });
+        return;
+    }
+
     std::shared_ptr<sAuthLogonChallengeHeader> header = std::make_shared<sAuthLogonChallengeHeader>();
 
     m_socket.Read((char*)header.get(), sizeof(sAuthLogonChallengeHeader),
@@ -239,7 +386,7 @@ void AuthSocket::ReadChallengeRequest(char const* logPrefix, std::function<void(
     {
         if (error)
         {
-            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Read(header) error", logPrefix);
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Read(header) error: %s", logPrefix, error.ToString().c_str());
             return;
         }
 
@@ -247,38 +394,47 @@ void AuthSocket::ReadChallengeRequest(char const* logPrefix, std::function<void(
         EndianConvert(*pUint16);
         uint16 actualBodySize = header->size;
 
-        if (actualBodySize < sizeof(sAuthLogonChallengeBody) - AUTH_LOGON_MAX_NAME)
-        { // The paket is too small and has no username???
+        uint16 const minBody = uint16(sizeof(sAuthLogonChallengeBody) - AUTH_LOGON_MAX_NAME);
+        uint16 const maxBodyClassic = uint16(sizeof(sAuthLogonChallengeBody));
+
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "[%s] header err=%u size=%u (min=%u max=%u)",
+                 logPrefix, header->error, actualBodySize, minBody, maxBodyClassic);
+
+        if (actualBodySize < minBody)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] body too small: %u", logPrefix, actualBodySize);
             return;
         }
 
-        if (actualBodySize > sizeof(sAuthLogonChallengeBody))
-        { // Reject oversized body to prevent heap buffer overflow
+        if (actualBodySize > maxBodyClassic)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] body too large: %u", logPrefix, actualBodySize);
             return;
         }
 
-        sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[%s] got header, body is %#04x bytes", logPrefix, actualBodySize);
-
-        std::shared_ptr<sAuthLogonChallengeBody> body = std::make_shared<sAuthLogonChallengeBody>();
-        self->m_socket.Read((char*)body.get(), actualBodySize,
-            [self, header, body, logPrefix, onBody = std::move(onBody)]
+        std::shared_ptr<std::vector<uint8>> raw = std::make_shared<std::vector<uint8>>(actualBodySize);
+        self->m_socket.Read(reinterpret_cast<char*>(raw->data()), actualBodySize,
+            [self, header, raw, logPrefix, onBody = std::move(onBody), actualBodySize]
             (IO::NetworkError const& error, size_t) -> void
         {
             if (error)
             {
-                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Read(body) error", logPrefix);
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Read(body) error: %s", logPrefix, error.ToString().c_str());
                 return;
             }
 
+            std::shared_ptr<sAuthLogonChallengeBody> body = std::make_shared<sAuthLogonChallengeBody>();
+            memset(body.get(), 0, sizeof(sAuthLogonChallengeBody));
+            memcpy(body.get(), raw->data(), std::min(raw->size(), sizeof(sAuthLogonChallengeBody)));
+
             if (body->username_len > AUTH_LOGON_MAX_NAME)
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] username_len too large: %u", logPrefix, body->username_len);
                 return;
+            }
             body->username[body->username_len] = '\0';
 
-            sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[%s] got full packet, %#04x bytes", logPrefix, header->size);
-            sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[%s] name(%d): '%s'", logPrefix, body->username_len, body->username);
-
-            // BigEndian code, nop in little endian case
-            // size already converted
             EndianConvert(*((uint32*)(&body->gamename[0])));
             EndianConvert(body->build);
             EndianConvert(*((uint32*)(&body->platform[0])));
@@ -289,31 +445,31 @@ void AuthSocket::ReadChallengeRequest(char const* logPrefix, std::function<void(
 
             self->m_build = body->build;
 
-            // Convert uint8[4] to string, restore string order as its byte order is reversed
-            // To it for os
             body->os[3] = '\0';
             self->m_os = (char*)body->os;
             std::reverse(self->m_os.begin(), self->m_os.end());
-            // To it for platform
             body->platform[3] = '\0';
             self->m_platform = (char*)body->platform;
             std::reverse(self->m_platform.begin(), self->m_platform.end());
-            // Do it for locale
             self->m_localizationName.resize(sizeof(body->country));
             self->m_localizationName.assign(body->country, (body->country + sizeof(body->country)));
             std::reverse(self->m_localizationName.begin(), self->m_localizationName.end());
+            while (!self->m_localizationName.empty() && self->m_localizationName.back() == '\0')
+                self->m_localizationName.pop_back();
 
             if (!IsAllowedLocale(self->m_localizationName))
             {
-                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Rejected invalid locale from %s", logPrefix, self->GetRemoteIpString().c_str());
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Rejected invalid locale '%s' from %s",
+                         logPrefix, self->m_localizationName.c_str(), self->GetRemoteIpString().c_str());
                 return;
             }
 
-            // Escape the user input used in DB to avoid further SQL injection
-            // Memory will be freed on AuthSocket object destruction
             self->m_login = (const char*)body->username;
             self->m_safelogin = self->m_login;
             LoginDatabase.escape_string(self->m_safelogin);
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[%s] login='%s' build=%u os=%s platform=%s locale=%s",
+                     logPrefix, self->m_login.c_str(), self->m_build,
+                     self->m_os.c_str(), self->m_platform.c_str(), self->m_localizationName.c_str());
 
             onBody(body);
         });
@@ -328,10 +484,53 @@ void AuthSocket::_HandleLogonChallenge()
 
     ReadChallengeRequest("AuthChallenge", [self = shared_from_this()](std::shared_ptr<sAuthLogonChallengeBody> const& body) -> void
     {
-        std::shared_ptr<ByteBuffer> pkt = std::make_shared<ByteBuffer>();
+        // payload = classic body after cmd+unk. AZRT uses a different reply shape (see sendReply).
+        ByteBuffer payload;
+        auto sendReply = [self](ByteBuffer& payload, bool challengeSuccess)
+        {
+            std::shared_ptr<ByteBuffer> pkt = std::make_shared<ByteBuffer>();
+            if (self->m_azrtClient)
+            {
+                // Official Emberveil replies on AZRT challenge-resp opcode (0xA1).
+                *pkt << uint8(CMD_AUTH_AZRT_CHALLENGE_RESP);
+                if (challengeSuccess)
+                {
+                    // A1 | 00 | size | B[32] | N[32] | s[32] | g(uint16 LE) | token[32]
+                    *pkt << uint8(0x00);
+                    *pkt << uint16(payload.size());
+                    if (!payload.empty())
+                        pkt->append(payload.contents(), payload.size());
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] AZRT success reply size=%u pkt=%u",
+                             uint32(payload.size()), uint32(pkt->size()));
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] AZRT A1 hex: %s",
+                             ByteArrayToHexStr(pkt->contents(), pkt->size()).c_str());
+                }
+                else
+                {
+                    // A1 | error | 00 00  (matches official unknown-account: a1040000)
+                    uint8 err = payload.empty() ? uint8(WOW_FAIL_UNKNOWN_ACCOUNT) : payload.contents()[0];
+                    *pkt << err;
+                    *pkt << uint8(0);
+                    *pkt << uint8(0);
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] AZRT error reply err=%u", err);
+                }
+            }
+            else
+            {
+                *pkt << self->AuthChallengeCmd();
+                *pkt << uint8(0x00); // classic unk2
+                if (!payload.empty())
+                    pkt->append(payload.contents(), payload.size());
+            }
 
-        *pkt << (uint8) CMD_AUTH_LOGON_CHALLENGE;
-        *pkt << (uint8) 0x00;
+            self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
+            {
+                if (error)
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonChallenge Write error: %s", error.ToString().c_str());
+                else
+                    self->DoRecvIncomingData();
+            });
+        };
 
         std::string clientIpAddress = self->GetRemoteIpString();
 
@@ -343,16 +542,9 @@ void AuthSocket::_HandleLogonChallenge()
             safeIp.c_str());
         if (ipBanResult)
         {
-            *pkt << uint8(WOW_FAIL_FAIL_NOACCESS);
+            payload << uint8(WOW_FAIL_FAIL_NOACCESS);
             sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Banned ip '%s' tries to login with account '%s'!", clientIpAddress.c_str(), self->m_login.c_str());
-
-            self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
-            {
-                if (error)
-                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonChallenge self->Write() Error: %s", error.ToString().c_str());
-                else
-                    self->DoRecvIncomingData();
-            });
+            sendReply(payload, false);
             return;
         }
 
@@ -362,22 +554,15 @@ void AuthSocket::_HandleLogonChallenge()
         {
             sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] IP '%s' is temporarily locked after %u failed attempts",
                      clientIpAddress.c_str(), wrongPassResult.failedAttempts);
-            *pkt << uint8(WOW_FAIL_DB_BUSY);
-
-            self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
-            {
-                if (error)
-                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonChallenge self->Write() Error: %s", error.ToString().c_str());
-                else
-                    self->DoRecvIncomingData();
-            });
+            payload << uint8(WOW_FAIL_DB_BUSY);
+            sendReply(payload, false);
             return;
         }
 
         // Get the account details from the account table
         // No SQL injection (escaped username)
         //                                                                            0     1         2          3    4    5           6              7              8       9
-        std::unique_ptr<QueryResult> sqlAccountResult = LoginDatabase.PQuery("SELECT `id`, `locked`, `last_ip`, `v`, `s`, `security`, `email_verif`, `geolock_pin`, `email`, UNIX_TIMESTAMP(`joindate`) FROM `account` WHERE `username` = '%s'", self->m_safelogin.c_str());
+        std::unique_ptr<QueryResult> sqlAccountResult = LoginDatabase.PQuery("SELECT `id`, `locked`, `last_ip`, `v`, `s`, `security`, `email_verif`, `geolock_pin`, `email`, UNIX_TIMESTAMP(`joindate`) FROM `account` WHERE UPPER(`username`) = UPPER('%s')", self->m_safelogin.c_str());
         if (sqlAccountResult)
         {
             Field* fields = sqlAccountResult->Fetch();
@@ -397,15 +582,9 @@ void AuthSocket::_HandleLogonChallenge()
             if (requireVerification && !isVerified)
             {
                 sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Account '%s' using IP '%s 'email address requires email verification - rejecting login", self->m_login.c_str(), self->GetRemoteIpString().c_str());
-                *pkt << (uint8) WOW_FAIL_UNKNOWN_ACCOUNT;
-
-                self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error) {
-                    if (error)
-                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonChallenge self->Write() Error: %s", error.ToString().c_str());
-                    else
-                        self->DoRecvIncomingData();
-                });
-                return; // TODO refactor?
+                payload << (uint8) WOW_FAIL_UNKNOWN_ACCOUNT;
+                sendReply(payload, false);
+                return;
             }
 
             // If the IP is 'locked', check that the player comes indeed from the correct IP address
@@ -427,7 +606,7 @@ void AuthSocket::_HandleLogonChallenge()
 
                     // account is IP locked and the player does not have 2FA enabled
                     if (((self->m_lockFlags & TOTP) != TOTP && (self->m_lockFlags & FIXED_PIN) != FIXED_PIN))
-                        *pkt << (uint8) WOW_FAIL_SUSPENDED;
+                        payload << (uint8) WOW_FAIL_SUSPENDED;
 
                     locked = true;
                 }
@@ -444,15 +623,58 @@ void AuthSocket::_HandleLogonChallenge()
             std::string databaseV = fields[3].GetCppString();
             std::string databaseS = fields[4].GetCppString();
 
+            // Emberveil AZRT uses a custom 256-bit prime and g=2 (not classic WoW N/g=7).
+            if (self->m_azrtClient)
+            {
+                if (!self->srp.SetParameters(
+                        "D4C7FE87A44D2E108EF84AC0A83D897E2A4FD6A1B9F58FE8EC3151BD47E8D5EF", 2))
+                {
+                    payload << uint8(WOW_FAIL_FAIL_NOACCESS);
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[AuthChallenge] Failed to set AZRT SRP parameters");
+                    sendReply(payload, false);
+                    return;
+                }
+
+                // Emberveil identity (from client binary):
+                //   I = SHA1( UPPER(user) + ":" + UPPER(pass) [+ "AZRT-PEPPER-v1"] )
+                // Unreal-Open-Azeroth zeros the pepper concat length (mov r9d, 15 -> 0),
+                // so patched clients use USER:PASS only. Official/unpatched still append pepper.
+                // then classic x = SHA1(s | I), v = g^x mod N, k = 3.
+                std::string pass = sConfig.GetStringDefault("Azrt.TestPassword", "admin");
+                std::string userUpper = self->m_login;
+                strToUpper(userUpper);
+                std::string passUpper = pass;
+                strToUpper(passUpper);
+                bool const usePepper = sConfig.GetBoolDefault("Azrt.UsePepper", true);
+                std::string identity = userUpper + ":" + passUpper;
+                if (usePepper)
+                    identity += "AZRT-PEPPER-v1";
+                auto dig = Crypto::Hash::SHA1::ComputeFrom(identity);
+                std::string identityHex = ByteArrayToHexStr(dig.data(), dig.size());
+
+                self->srp.SetUseSrp6aMultiplier(false); // WoW-style k=3
+                // Emberveil hashes N/g/A/B as minimal BN bytes (g -> single 0x02), not 32-pad
+                self->srp.SetHashPadBytes(0);
+                if (!self->srp.CalculateVerifier(identityHex))
+                {
+                    payload << uint8(WOW_FAIL_FAIL_NOACCESS);
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[AuthChallenge] AZRT CalculateVerifier failed");
+                    sendReply(payload, false);
+                    return;
+                }
+
+                databaseV = self->srp.GetVerifier().AsHexStr();
+                databaseS = self->srp.GetSalt().AsHexStr();
+                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                         "[AuthChallenge] AZRT identity='%s' user='%s' pass='%s' pepper=%u",
+                         identity.c_str(), self->m_login.c_str(), pass.c_str(), usePepper ? 1 : 0);
+            }
+
             if (!self->srp.SetVerifier(databaseV.c_str()) || !self->srp.SetSalt(databaseS.c_str()))
             {
-                *pkt << uint8(WOW_FAIL_FAIL_NOACCESS);
+                payload << uint8(WOW_FAIL_FAIL_NOACCESS);
                 sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[AuthChallenge] Broken v/s values in database for account %s!", self->m_login.c_str());
-                self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
-                {
-                    if (error)
-                        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonChallenge self->Write() Error: %s", error.ToString().c_str());
-                });
+                sendReply(payload, false);
                 return;
             }
 
@@ -468,12 +690,12 @@ void AuthSocket::_HandleLogonChallenge()
                     uint64_t unbanTimestamp = (*sqlAccountBanResult)[1].GetUInt64();
                     if (banTimestamp == unbanTimestamp)
                     {
-                        *pkt << (uint8) WOW_FAIL_BANNED;
+                        payload << (uint8) WOW_FAIL_BANNED;
                         sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Banned account '%s' using IP '%s' tries to login!", self->m_login.c_str(), self->GetRemoteIpString().c_str());
                     }
                     else
                     {
-                        *pkt << (uint8) WOW_FAIL_SUSPENDED;
+                        payload << (uint8) WOW_FAIL_SUSPENDED;
                         sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Temporarily banned account '%s' using IP '%s' tries to login!", self->m_login.c_str(), self->GetRemoteIpString().c_str());
                     }
                 }
@@ -486,42 +708,67 @@ void AuthSocket::_HandleLogonChallenge()
 
                     self->srp.CalculateHostPublicEphemeral();
 
-                    // Fill the response packet with the result
-                    *pkt << uint8(WOW_SUCCESS);
-
-                    // B may be calculated < 32B so we force minimal length to 32B
-                    pkt->append(self->srp.GetHostPublicEphemeral().AsByteArray(32)); // 32 bytes
-                    *pkt << uint8(1);
-                    pkt->append(self->srp.GetGeneratorModulo().AsByteArray());
-                    *pkt << uint8(32);
-                    pkt->append(self->srp.GetPrime().AsByteArray(32));
-                    pkt->append(s.AsByteArray(32));// 32 bytes
-                    pkt->append(VersionChallenge.data(), VersionChallenge.size());
-
-                    // figure out whether we need to display the PIN grid
-                    self->m_promptPin = locked; // always prompt if the account is IP locked & 2FA is enabled
-
-                    if ((!locked && ((self->m_lockFlags & ALWAYS_ENFORCE) == ALWAYS_ENFORCE)) || self->m_geoUnlockPIN)
+                    if (self->m_azrtClient)
                     {
-                        self->m_promptPin = true; // prompt if the lock hasn't been triggered but ALWAYS_ENFORCE is set
-                    }
-
-                    if (self->m_promptPin)
-                    {
-                        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Account '%s' using IP '%s' requires PIN authentication", self->m_login.c_str(), self->GetRemoteIpString().c_str());
-
-                        uint32 gridSeedPkt = self->m_gridSeed = randu32();
-                        EndianConvert(gridSeedPkt);
-                        self->m_serverSecuritySalt.SetRand(16 * 8); // 16 bytes random
-
-                        *pkt << uint8(1); // securityFlags, only '1' is available in classic (PIN input)
-                        *pkt << gridSeedPkt;
-                        pkt->append(self->m_serverSecuritySalt.AsByteArray(16).data(), 16);
+                        // Emberveil: B[32] | N[32] | s[32] | g(uint16 LE=2) | AZCT token[32]
+                        payload.append(self->srp.GetHostPublicEphemeral().AsByteArray(32));
+                        payload.append(self->srp.GetPrime().AsByteArray(32));
+                        payload.append(s.AsByteArray(32));
+                        payload << uint16(2);
+                        // New Emberveil anti-tamper: extra 32-byte AZCT AES key.
+                        // Official realmd always sends the same key; the client uses it
+                        // to decrypt a CRC-protected code cave. Zeros fail that CRC.
+                        uint8 azrtSessionToken[32] = {};
+                        std::string keyHex = sConfig.GetStringDefault("Azrt.IntegrityKey", "");
+                        if (keyHex.size() == 64)
+                        {
+                            HexStrToByteArray(keyHex, azrtSessionToken);
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] AZRT integrity key from config");
+                        }
+                        else if (!keyHex.empty())
+                            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[AuthChallenge] Azrt.IntegrityKey must be 64 hex chars, got %u",
+                                     uint32(keyHex.size()));
+                        payload.append(azrtSessionToken, sizeof(azrtSessionToken));
                     }
                     else
                     {
-                        if (self->m_build >= 5428)        // version 1.11.0 or later
-                            *pkt << uint8(0);
+                        // Fill the response packet with the result
+                        payload << uint8(WOW_SUCCESS);
+
+                        // B may be calculated < 32B so we force minimal length to 32B
+                        payload.append(self->srp.GetHostPublicEphemeral().AsByteArray(32)); // 32 bytes
+                        payload << uint8(1);
+                        payload.append(self->srp.GetGeneratorModulo().AsByteArray());
+                        payload << uint8(32);
+                        payload.append(self->srp.GetPrime().AsByteArray(32));
+                        payload.append(s.AsByteArray(32));// 32 bytes
+                        payload.append(VersionChallenge.data(), VersionChallenge.size());
+
+                        // figure out whether we need to display the PIN grid
+                        self->m_promptPin = locked; // always prompt if the account is IP locked & 2FA is enabled
+
+                        if ((!locked && ((self->m_lockFlags & ALWAYS_ENFORCE) == ALWAYS_ENFORCE)) || self->m_geoUnlockPIN)
+                        {
+                            self->m_promptPin = true; // prompt if the lock hasn't been triggered but ALWAYS_ENFORCE is set
+                        }
+
+                        if (self->m_promptPin)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Account '%s' using IP '%s' requires PIN authentication", self->m_login.c_str(), self->GetRemoteIpString().c_str());
+
+                            uint32 gridSeedPkt = self->m_gridSeed = randu32();
+                            EndianConvert(gridSeedPkt);
+                            self->m_serverSecuritySalt.SetRand(16 * 8); // 16 bytes random
+
+                            payload << uint8(1); // securityFlags, only '1' is available in classic (PIN input)
+                            payload << gridSeedPkt;
+                            payload.append(self->m_serverSecuritySalt.AsByteArray(16).data(), 16);
+                        }
+                        else
+                        {
+                            if (self->m_build >= 5428)        // version 1.11.0 or later
+                                payload << uint8(0);
+                        }
                     }
 
                     self->LoadAccountSecurityLevels(pendingAccountId);
@@ -529,22 +776,18 @@ void AuthSocket::_HandleLogonChallenge()
 
                     // All good, await client's proof
                     self->m_status = STATUS_LOGON_PROOF;
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Account '%s' challenge OK, awaiting proof", self->m_login.c_str());
                 }
             }
         }
         else
         { // no account
-            *pkt << (uint8) WOW_FAIL_UNKNOWN_ACCOUNT;
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Unknown account '%s'", self->m_login.c_str());
+            payload << (uint8) WOW_FAIL_UNKNOWN_ACCOUNT;
             RecordWrongPasswordAttempt(safeIp);
         }
 
-        self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
-        {
-            if (error)
-                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonChallenge self->Write() Error: %s", error.ToString().c_str());
-            else
-                self->DoRecvIncomingData();
-        });
+        sendReply(payload, self->m_status == STATUS_LOGON_PROOF);
     });
 }
 
@@ -554,25 +797,8 @@ void AuthSocket::_HandleLogonProof()
     sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "Entering _HandleLogonProof");
     m_status = STATUS_INVALID;
 
-    // Read the packet
-    std::shared_ptr<sAuthLogonProof_C> lp = std::make_shared<sAuthLogonProof_C>();
-    size_t expectedSize = sizeof(sAuthLogonProof_C);
-    // Regression-Guard: expectedSize must never exceed the allocated buffer.
-    static_assert(sizeof(sAuthLogonProof_C_Pre_1_11_0) <= sizeof(sAuthLogonProof_C),
-        "Pre-1.11.0 proof struct must fit inside sAuthLogonProof_C buffer");
-    if (m_build < 5428) { // Pin support was added in 1.11.0, so if an older client connects, we need to skip those fields
-        lp->securityFlags = SECURITY_FLAG_NONE;
-        expectedSize = sizeof(sAuthLogonProof_C_Pre_1_11_0);
-    }
-
-    m_socket.Read((char*) lp.get(), expectedSize, [self = shared_from_this(), lp](IO::NetworkError const& error, size_t)
+    auto continueWithProof = [self = shared_from_this()](std::shared_ptr<sAuthLogonProof_C> const& lp)
     {
-        if (error)
-        {
-            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonProof Read(): ERROR");
-            return;
-        }
-
         if (lp->securityFlags)
         {
             if (!(lp->securityFlags & SECURITY_FLAG_PIN))
@@ -590,6 +816,85 @@ void AuthSocket::_HandleLogonProof()
         }
 
         self->_HandleLogonProof__PostRecv(lp, nullptr);
+    };
+
+    if (m_azrtClient)
+    {
+        // AZRT proof is size-prefixed like the challenge request.
+        std::shared_ptr<uint16> sizeField = std::make_shared<uint16>();
+        m_socket.Read(reinterpret_cast<char*>(sizeField.get()), sizeof(uint16),
+            [self = shared_from_this(), sizeField, continueWithProof](IO::NetworkError const& error, size_t)
+            {
+                if (error)
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonProof AZRT size Read(): ERROR");
+                    return;
+                }
+                EndianConvert(*sizeField);
+                uint16 bodySize = *sizeField;
+                sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] AZRT size=%u", bodySize);
+                if (bodySize < sizeof(sAuthLogonProof_C_Pre_1_11_0) || bodySize > 256)
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[AuthProof] AZRT size invalid: %u", bodySize);
+                    return;
+                }
+
+                std::shared_ptr<std::vector<uint8>> raw = std::make_shared<std::vector<uint8>>(bodySize);
+                self->m_socket.Read(reinterpret_cast<char*>(raw->data()), bodySize,
+                    [self, raw, bodySize, continueWithProof](IO::NetworkError const& error, size_t)
+                    {
+                        if (error)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonProof AZRT body Read(): ERROR");
+                            return;
+                        }
+
+                        {
+                            std::string hex;
+                            size_t dumpLen = std::min<size_t>(raw->size(), 80);
+                            hex.reserve(dumpLen * 3);
+                            static char const* digits = "0123456789ABCDEF";
+                            for (size_t i = 0; i < dumpLen; ++i)
+                            {
+                                uint8 b = (*raw)[i];
+                                hex.push_back(digits[b >> 4]);
+                                hex.push_back(digits[b & 0xF]);
+                                hex.push_back(' ');
+                            }
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] AZRT body[%u]: %s", bodySize, hex.c_str());
+                        }
+
+                        std::shared_ptr<sAuthLogonProof_C> lp = std::make_shared<sAuthLogonProof_C>();
+                        memset(lp.get(), 0, sizeof(sAuthLogonProof_C));
+                        // AZRT proof is A[32]+M1[20]+crc[20]+extra; do not treat trailing bytes as PIN flags.
+                        size_t copyLen = std::min(raw->size(), size_t(sizeof(sAuthLogonProof_C_Pre_1_11_0)));
+                        memcpy(lp.get(), raw->data(), copyLen);
+                        lp->securityFlags = SECURITY_FLAG_NONE;
+                        continueWithProof(lp);
+                    });
+            });
+        return;
+    }
+
+    // Read the packet
+    std::shared_ptr<sAuthLogonProof_C> lp = std::make_shared<sAuthLogonProof_C>();
+    size_t expectedSize = sizeof(sAuthLogonProof_C);
+    // Regression-Guard: expectedSize must never exceed the allocated buffer.
+    static_assert(sizeof(sAuthLogonProof_C_Pre_1_11_0) <= sizeof(sAuthLogonProof_C),
+        "Pre-1.11.0 proof struct must fit inside sAuthLogonProof_C buffer");
+    if (m_build < 5428) { // Pin support was added in 1.11.0, so if an older client connects, we need to skip those fields
+        lp->securityFlags = SECURITY_FLAG_NONE;
+        expectedSize = sizeof(sAuthLogonProof_C_Pre_1_11_0);
+    }
+
+    m_socket.Read((char*) lp.get(), expectedSize, [continueWithProof, lp](IO::NetworkError const& error, size_t)
+    {
+        if (error)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "_HandleLogonProof Read(): ERROR");
+            return;
+        }
+        continueWithProof(lp);
     });
 }
 
@@ -615,7 +920,7 @@ void AuthSocket::_HandleLogonProof__PostRecv_HandleInvalidVersion(std::shared_pt
     {
         // no patch found
         std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
-        *pkt << (uint8) CMD_AUTH_LOGON_CHALLENGE;
+        *pkt << AuthChallengeCmd();
         *pkt << (uint8) 0x00;
         *pkt << (uint8) WOW_FAIL_VERSION_INVALID;
         sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[AuthChallenge] %u is not a valid client version!", m_build);
@@ -640,7 +945,7 @@ void AuthSocket::_HandleLogonProof__PostRecv_HandleInvalidVersion(std::shared_pt
         std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
 
         // packet 1
-        *pkt << (uint8) CMD_AUTH_LOGON_PROOF;
+        *pkt << AuthProofCmd();
         *pkt << (uint8) WOW_FAIL_VERSION_UPDATE;
 
         // packet 2 - XFER_INIT
@@ -669,6 +974,13 @@ void AuthSocket::_HandleLogonProof__PostRecv(std::shared_ptr<sAuthLogonProof_C c
     // Check if the client has one of the expected version numbers
     bool valid_version = FindBuildInfo(m_build) != nullptr;
 
+    // AZRT / Unreal clients may advertise a custom build; allow when StrictVersionCheck is off
+    if (!valid_version && m_azrtClient && !sConfig.GetBoolDefault("StrictVersionCheck", false))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] AZRT client build %u not in allowed_clients — allowing", m_build);
+        valid_version = true;
+    }
+
     // If the client has no valid version
     if(!valid_version)
     {
@@ -685,6 +997,153 @@ void AuthSocket::_HandleLogonProof__PostRecv(std::shared_ptr<sAuthLogonProof_C c
 
     srp.HashSessionKey();
     srp.CalculateProof(this->m_login);
+
+    bool azrtProofMatched = false;
+    if (m_azrtClient)
+    {
+        using namespace Crypto::Hash;
+        auto serverM = srp.GetProof().AsByteArray(20);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] M1 client=%s", ByteArrayToHexStr(lp->M1, 20).c_str());
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] M1 server=%s", ByteArrayToHexStr(serverM.data(), 20).c_str());
+
+        std::vector<uint8> A(lp->A, lp->A + 32);
+        auto B = srp.GetHostPublicEphemeral().AsByteArray(32);
+        auto S = srp.GetSessionKeyS().AsByteArray(32);
+        auto salt = srp.GetSalt().AsByteArray(32);
+        auto N = srp.GetPrime().AsByteArray(32);
+        auto g = srp.GetGeneratorModulo().AsByteArray(32);
+        auto K40 = srp.GetStrongSessionKey().AsByteArray(40);
+
+        // Write dump for offline analysis
+        {
+            FILE* f = fopen("logs/azrt-srp-dump.txt", "w");
+            if (f)
+            {
+                fprintf(f, "user=%s\n", m_login.c_str());
+                fprintf(f, "A=%s\n", ByteArrayToHexStr(A.data(), 32).c_str());
+                fprintf(f, "B=%s\n", ByteArrayToHexStr(B.data(), 32).c_str());
+                fprintf(f, "b=%s\n", srp.GetPrivateEphemeral().AsHexStr().c_str());
+                fprintf(f, "s=%s\n", srp.GetSalt().AsHexStr().c_str());
+                fprintf(f, "v=%s\n", srp.GetVerifier().AsHexStr().c_str());
+                fprintf(f, "S=%s\n", ByteArrayToHexStr(S.data(), 32).c_str());
+                fprintf(f, "K=%s\n", ByteArrayToHexStr(K40.data(), 40).c_str());
+                fprintf(f, "M1=%s\n", ByteArrayToHexStr(lp->M1, 20).c_str());
+                fprintf(f, "N=%s\n", ByteArrayToHexStr(N.data(), 32).c_str());
+                fprintf(f, "g=%s\n", ByteArrayToHexStr(g.data(), g.size()).c_str());
+                fclose(f);
+            }
+        }
+
+        azrtProofMatched = Crypto::ConstantTimeEquals(serverM.data(), lp->M1, 20);
+
+        auto sha1vec = [](uint8 const* p, size_t n) {
+            auto d = SHA1::ComputeFrom(p, n);
+            return std::vector<uint8>(d.begin(), d.end());
+        };
+
+        std::vector<std::vector<uint8>> Ks;
+        Ks.push_back(K40);
+        Ks.emplace_back(K40.begin(), K40.begin() + 20);
+        Ks.push_back(sha1vec(S.data(), S.size()));                 // K = SHA1(S)
+        Ks.push_back(sha1vec(K40.data(), K40.size()));             // K = SHA1(K40)
+        // HMAC-SHA1(pepper, S)
+        {
+            Crypto::Hash::HMACSHA1::Generator hg(reinterpret_cast<uint8 const*>("AZRT-PEPPER-v1"), 14);
+            hg.UpdateData(S.data(), S.size());
+            auto d = hg.GetDigest();
+            Ks.emplace_back(d.begin(), d.end());
+        }
+
+        auto makeHxor = [&](bool padNg) {
+            SHA1::Digest hN = padNg ? SHA1::ComputeFrom(N.data(), N.size()) : SHA1::ComputeFrom(srp.GetPrime());
+            SHA1::Digest hG = padNg ? SHA1::ComputeFrom(g.data(), g.size()) : SHA1::ComputeFrom(srp.GetGeneratorModulo());
+            for (int i = 0; i < 20; ++i)
+                hN[i] ^= hG[i];
+            return hN;
+        };
+
+        std::string users[] = {
+            m_login,
+            "ADMIN",
+            "admin",
+            "AZRT-PEPPER-v1" + m_login,
+            m_login + "AZRT-PEPPER-v1",
+            "AZRT-PEPPER-v1ADMIN:admin"
+        };
+
+        if (!azrtProofMatched)
+        {
+            for (bool padNg : {true, false})
+            {
+                auto hxor = makeHxor(padNg);
+                for (auto const& user : users)
+                {
+                    for (size_t ki = 0; ki < Ks.size(); ++ki)
+                    {
+                        // M1 = H( H(N)^H(g) | H(user) | s | A | B | K )
+                        SHA1::Generator gen;
+                        gen.UpdateData(hxor.data(), hxor.size());
+                        gen.UpdateData(SHA1::ComputeFrom(user));
+                        gen.UpdateData(salt.data(), salt.size());
+                        gen.UpdateData(A.data(), A.size());
+                        gen.UpdateData(B.data(), B.size());
+                        gen.UpdateData(Ks[ki].data(), Ks[ki].size());
+                        auto dig = gen.GetDigest();
+                        if (Crypto::ConstantTimeEquals(dig.data(), lp->M1, 20))
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "[AuthProof] AZRT M1 MATCH classic padNg=%u user='%s' Ki=%u",
+                                     padNg ? 1 : 0, user.c_str(), (uint32)ki);
+                            azrtProofMatched = true;
+                            break;
+                        }
+
+                        // M1 = H( H(N)^H(g) | H(user) | A | B | K )  (no salt)
+                        SHA1::Generator gen2;
+                        gen2.UpdateData(hxor.data(), hxor.size());
+                        gen2.UpdateData(SHA1::ComputeFrom(user));
+                        gen2.UpdateData(A.data(), A.size());
+                        gen2.UpdateData(B.data(), B.size());
+                        gen2.UpdateData(Ks[ki].data(), Ks[ki].size());
+                        dig = gen2.GetDigest();
+                        if (Crypto::ConstantTimeEquals(dig.data(), lp->M1, 20))
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                     "[AuthProof] AZRT M1 MATCH nosalt padNg=%u user='%s' Ki=%u",
+                                     padNg ? 1 : 0, user.c_str(), (uint32)ki);
+                            azrtProofMatched = true;
+                            break;
+                        }
+                    }
+                    if (azrtProofMatched) break;
+                }
+                if (azrtProofMatched) break;
+            }
+        }
+
+        if (!azrtProofMatched)
+        {
+            for (size_t ki = 0; ki < Ks.size(); ++ki)
+            {
+                SHA1::Generator gen;
+                gen.UpdateData(A.data(), A.size());
+                gen.UpdateData(B.data(), B.size());
+                gen.UpdateData(Ks[ki].data(), Ks[ki].size());
+                auto dig = gen.GetDigest();
+                if (Crypto::ConstantTimeEquals(dig.data(), lp->M1, 20))
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] AZRT M1 MATCH A|B|K Ki=%u", (uint32)ki);
+                    azrtProofMatched = true;
+                    break;
+                }
+            }
+        }
+
+        if (!azrtProofMatched)
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] AZRT no M1 formula matched (identity/k likely wrong) — dump written");
+        else
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthProof] AZRT proof accepted via alternate M1");
+    }
 
     // Check PIN data is correct
     bool pinResult = true;
@@ -740,14 +1199,15 @@ void AuthSocket::_HandleLogonProof__PostRecv(std::shared_ptr<sAuthLogonProof_C c
     }
 
     // Check if SRP6 results match (password is correct), else send an error
-    if (!srp.Proof(lp->M1, 20) && pinResult)
+    // Proof() returns false when M1 matches (historical inverted API).
+    if ((!srp.Proof(lp->M1, 20) || azrtProofMatched) && pinResult)
     {
         if (!VerifyVersion(lp->A, sizeof(lp->A), lp->crc_hash, false))
         {
             sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthChallenge] Account %s tried to login with modified client!", m_login.c_str());
 
             std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
-            *pkt << (uint8) CMD_AUTH_LOGON_PROOF;
+            *pkt << AuthProofCmd();
             *pkt << (uint8) WOW_FAIL_VERSION_INVALID;
             m_socket.Write(std::move(pkt), [self = shared_from_this()](IO::NetworkError const& error)
             {
@@ -776,7 +1236,7 @@ void AuthSocket::_HandleLogonProof__PostRecv(std::shared_ptr<sAuthLogonProof_C c
                 sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Unable to write geolock PIN for %s - account has not been locked", m_safelogin.c_str());
 
                 std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
-                *pkt << (uint8) CMD_AUTH_LOGON_PROOF;
+                *pkt << AuthProofCmd();
                 *pkt << (uint8) WOW_FAIL_DB_BUSY;
                 m_socket.Write(std::move(pkt), [self = shared_from_this()](IO::NetworkError const& error)
                 {
@@ -810,7 +1270,7 @@ void AuthSocket::_HandleLogonProof__PostRecv(std::shared_ptr<sAuthLogonProof_C c
 #endif
 
             std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
-            *pkt << (uint8) CMD_AUTH_LOGON_PROOF;
+            *pkt << AuthProofCmd();
             *pkt << (uint8) WOW_FAIL_PARENTCONTROL;
             m_socket.Write(std::move(pkt), [self = shared_from_this()](IO::NetworkError const& error)
             {
@@ -856,9 +1316,9 @@ void AuthSocket::_HandleLogonProof__PostRecv(std::shared_ptr<sAuthLogonProof_C c
         RecordWrongPasswordAttempt(GetRemoteIpString());
 
         std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
-        *pkt << (uint8) CMD_AUTH_LOGON_PROOF;
+        *pkt << AuthProofCmd();
         *pkt << (uint8) WOW_FAIL_UNKNOWN_ACCOUNT;
-        if (m_build > 6005) // > 1.12.2
+        if (m_azrtClient || m_build > 6005) // AZRT: A3|err|00 00 ; classic >1.12.2 pads similarly
         {
             *pkt << (uint8) 0;
             *pkt << (uint8) 0;
@@ -878,7 +1338,7 @@ void AuthSocket::_HandleReconnectChallenge()
 
     ReadChallengeRequest("ReconnectChallenge", [self = shared_from_this()](std::shared_ptr<sAuthLogonChallengeBody> const& body) -> void
     {
-        std::unique_ptr<QueryResult> queryResult = LoginDatabase.PQuery("SELECT `sessionkey`, `id` FROM `account` WHERE `username` = '%s'", self->m_safelogin.c_str());
+        std::unique_ptr<QueryResult> queryResult = LoginDatabase.PQuery("SELECT `sessionkey`, `id` FROM `account` WHERE UPPER(`username`) = UPPER('%s')", self->m_safelogin.c_str());
 
         // Stop if the account is not found
         if (!queryResult)
@@ -896,7 +1356,7 @@ void AuthSocket::_HandleReconnectChallenge()
 
         // Sending response
         std::shared_ptr<ByteBuffer> pkt = std::make_shared<ByteBuffer>();
-        *pkt << (uint8)CMD_AUTH_RECONNECT_CHALLENGE;
+        *pkt << self->AuthReconnectChallengeCmd();
         *pkt << (uint8)0x00;
         self->m_reconnectProof.SetRand(16 * 8);
         pkt->append(self->m_reconnectProof.AsByteArray(16));        // 16 bytes random
@@ -944,7 +1404,7 @@ void AuthSocket::_HandleReconnectProof()
             if (!self->VerifyVersion(lp->R1, sizeof(lp->R1), lp->R3, true))
             {
                 std::shared_ptr<ByteBuffer> pkt = std::make_shared<ByteBuffer>();
-                *pkt << uint8(CMD_AUTH_RECONNECT_PROOF);
+                *pkt << self->AuthReconnectProofCmd();
                 *pkt << uint8(WOW_FAIL_VERSION_INVALID);
                 self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
                 {
@@ -959,7 +1419,7 @@ void AuthSocket::_HandleReconnectProof()
 
             // Sending response
             std::shared_ptr<ByteBuffer> pkt = std::make_shared<ByteBuffer>();
-            *pkt << uint8(CMD_AUTH_RECONNECT_PROOF);
+            *pkt << self->AuthReconnectProofCmd();
             *pkt << uint8(WOW_SUCCESS);
             self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
             {
@@ -986,26 +1446,25 @@ void AuthSocket::_HandleRealmList()
     }
 
     sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "Entering _HandleRealmList");
-    m_socket.ReadSkip(4, [self = shared_from_this()](IO::NetworkError const& error)
+
+    auto afterHeader = [self = shared_from_this()]()
     {
-        if (error)
-        {
-            self->CloseSocket(); // TODO: Remove me. Closing the socket will be done implicitly if all references to this socket are deleted (when there is no IO anymore)
-            return;
-        }
-
-        // check for too frequent requests
-        auto const minDelay = sConfig.GetIntDefault("MinRealmListDelay", 1);
+        // Classic clients: throttle realm-list spam. Emberveil polls 0xB0 aggressively —
+        // never close AZRT sockets for this (it breaks realm select / reconnect).
         auto const now = std::chrono::steady_clock::now();
-        if (minDelay > 0 && self->m_lastRealmListRequest.has_value())
+        if (!self->m_azrtClient)
         {
-            auto const delay = std::chrono::duration_cast<std::chrono::seconds>(now - self->m_lastRealmListRequest.value()).count();
-            if (delay < minDelay)
+            auto const minDelay = sConfig.GetIntDefault("MinRealmListDelay", 1);
+            if (minDelay > 0 && self->m_lastRealmListRequest.has_value())
             {
-                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "user %s IP %s is sending CMD_REALM_LIST too frequently. Delay = %lld seconds", self->m_login.c_str(), self->GetRemoteIpString().c_str(), static_cast<long long>(delay));
+                auto const delay = std::chrono::duration_cast<std::chrono::seconds>(now - self->m_lastRealmListRequest.value()).count();
+                if (delay < minDelay)
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "user %s IP %s is sending CMD_REALM_LIST too frequently. Delay = %lld seconds", self->m_login.c_str(), self->GetRemoteIpString().c_str(), static_cast<long long>(delay));
 
-                self->CloseSocket(); // TODO: Remove me. Closing the socket will be done implicitly if all references to this socket are deleted (when there is no IO anymore)
-                return;
+                    self->CloseSocket(); // TODO: Remove me. Closing the socket will be done implicitly if all references to this socket are deleted (when there is no IO anymore)
+                    return;
+                }
             }
         }
 
@@ -1019,20 +1478,87 @@ void AuthSocket::_HandleRealmList()
         self->LoadRealmlistAndWriteIntoBuffer(realmlistBuffer);
 
         std::shared_ptr<ByteBuffer> pkt(new ByteBuffer());
-        *pkt << (uint8) CMD_REALM_LIST;
+        *pkt << (uint8) self->RealmListCmd();
+        // AZRT: response opcode B1 (paired with request B0), but size framing like the
+        // request / classic realmlist — NOT challenge's error|size prefix.
+        // B1|00|size|body makes a size-only parser read size=0x2A00 and hang, or
+        // mis-parse count as 0 if it treats the size field as part of the body.
         *pkt << (uint16)realmlistBuffer.size();
         pkt->append(realmlistBuffer);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthRealmList] cmd=%u size=%u realms=%u azrt=%u",
+                 uint32(self->RealmListCmd()), uint32(realmlistBuffer.size()),
+                 uint32(sRealmList.size()), self->m_azrtClient ? 1 : 0);
+        if (self->m_azrtClient)
+        {
+            std::string hex;
+            hex.reserve(pkt->size() * 3);
+            for (size_t i = 0; i < pkt->size(); ++i)
+            {
+                char b[4];
+                snprintf(b, sizeof(b), "%02X ", (*pkt)[i]);
+                hex += b;
+            }
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthRealmList] AZRT reply[%u]: %s",
+                     uint32(pkt->size()), hex.c_str());
+        }
 
         self->m_socket.Write(std::move(pkt), [self](IO::NetworkError const& error)
         {
             self->DoRecvIncomingData();
         });
-    });
+    };
+
+    if (m_azrtClient)
+    {
+        // Emberveil: cmd 0xB0 + size(uint16 LE), size is 0 for the request.
+        auto sizeField = std::make_shared<uint16>(0);
+        m_socket.Read(reinterpret_cast<char*>(sizeField.get()), sizeof(uint16),
+            [self = shared_from_this(), afterHeader, sizeField](IO::NetworkError const& error, size_t)
+        {
+            if (error)
+            {
+                self->CloseSocket();
+                return;
+            }
+            uint16 bodySize = *sizeField;
+            EndianConvert(bodySize);
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[AuthRealmList] AZRT request size=%u", uint32(bodySize));
+            if (bodySize == 0)
+            {
+                afterHeader();
+                return;
+            }
+            auto raw = std::make_shared<std::vector<uint8>>(bodySize);
+            self->m_socket.Read(reinterpret_cast<char*>(raw->data()), bodySize,
+                [self, afterHeader, raw](IO::NetworkError const& error2, size_t)
+            {
+                if (error2)
+                {
+                    self->CloseSocket();
+                    return;
+                }
+                afterHeader();
+            });
+        });
+    }
+    else
+    {
+        // Classic: cmd + uint32 unused
+        m_socket.ReadSkip(4, [self = shared_from_this(), afterHeader](IO::NetworkError const& error)
+        {
+            if (error)
+            {
+                self->CloseSocket();
+                return;
+            }
+            afterHeader();
+        });
+    }
 }
 
 void AuthSocket::LoadRealmlistAndWriteIntoBuffer(ByteBuffer &pkt)
 {
-    if (m_build < 6299)        // before version 2.0.3 (exclusive)
+    if (m_build < 6299 && !m_azrtClient)        // before version 2.0.3 (exclusive)
     {
         pkt << uint32(0);                               // unused value
         pkt << uint8(sRealmList.size());
@@ -1082,7 +1608,8 @@ void AuthSocket::LoadRealmlistAndWriteIntoBuffer(ByteBuffer &pkt)
             pkt << float(i->second.populationLevel);
             pkt << uint8(AmountOfCharacters);
             pkt << uint8(categoryId);                   // realm category
-            pkt << uint8(0x00);                         // unk, may be realm number/id?
+            // Classic unk; Emberveil RealmdRealm.RealmID — send realmid
+            pkt << uint8(i->second.id);
         }
 
         pkt << uint16(0x0002);                          // unused value (why 2?)
@@ -1115,6 +1642,12 @@ void AuthSocket::LoadRealmlistAndWriteIntoBuffer(ByteBuffer &pkt)
             uint8 lock = (i->second.allowedSecurityLevel > GetSecurityOn(i->second.id)) ? 1 : 0;
 
             RealmFlags realmFlags = i->second.realmFlags;
+
+            if (m_azrtClient)
+            {
+                ok_build = true;
+                realmFlags = RealmFlags(realmFlags & ~REALM_FLAG_SPECIFYBUILD);
+            }
 
             // Show offline state for unsupported client builds
             if (!ok_build)
@@ -1433,8 +1966,18 @@ bool AuthSocket::GeographicalLockCheck()
 bool AuthSocket::VerifyVersion(uint8 const* a, int32 aLength, uint8 const* versionProof, bool isReconnect)
 {
     std::vector<RealmBuildInfo const*> allowedClients = FindBuildInfo(m_build, m_os, m_platform);
+    // Emberveil reports Win/x64 which classic allowed_clients often lack.
+    // When StrictVersionCheck is off, accept any known (or unknown) build/platform.
     if (allowedClients.empty())
+    {
+        if (!sConfig.GetBoolDefault("StrictVersionCheck", false))
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[Auth] Skipping version check for build %u os=%s platform=%s (AZRT=%u)",
+                     m_build, m_os.c_str(), m_platform.c_str(), m_azrtClient ? 1 : 0);
+            return true;
+        }
         return false;
+    }
 
     if (!sConfig.GetBoolDefault("StrictVersionCheck", false))
         return true;

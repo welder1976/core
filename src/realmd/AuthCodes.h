@@ -38,6 +38,22 @@ enum eAuthCmd : uint8
     CMD_XFER_ACCEPT                 = 0x32,
     CMD_XFER_RESUME                 = 0x33,
     CMD_XFER_CANCEL                 = 0x34,
+
+    // Unreal Azeroth / Emberveil (AZRT)
+    // Client challenge request  = 0xA0
+    // Server challenge response = 0xA1  (also used for auth errors like unknown account)
+    // Client logon proof        = 0xA2
+    // Server logon proof / recon= 0xA3
+    CMD_AUTH_AZRT_LOGON_CHALLENGE     = 0xA0,
+    CMD_AUTH_AZRT_CHALLENGE_RESP      = 0xA1,
+    CMD_AUTH_AZRT_LOGON_PROOF         = 0xA2,
+    CMD_AUTH_AZRT_PROOF_RESP          = 0xA3,
+    // Realm list follows the same req/resp pairing as challenge/proof (A0→A1, A2→A3).
+    CMD_AUTH_AZRT_REALM_LIST          = 0xB0, // client request
+    CMD_AUTH_AZRT_REALM_LIST_RESP     = 0xB1, // server response
+    // Aliases kept for older patch references
+    CMD_AUTH_AZRT_RECONNECT_CHALLENGE = CMD_AUTH_AZRT_LOGON_PROOF,
+    CMD_AUTH_AZRT_RECONNECT_PROOF     = CMD_AUTH_AZRT_PROOF_RESP,
 };
 
 // not used by us currently

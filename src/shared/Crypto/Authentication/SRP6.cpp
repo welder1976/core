@@ -36,7 +36,25 @@ void SRP6::CalculateHostPublicEphemeral(void)
 {
     b.SetRand(19 * 8);
     BigNumber gmod = g.ModExp(b, N);
-    B = ((v * 3) + gmod) % N;
+
+    if (m_useSrp6aK)
+    {
+        int pad = m_hashPadBytes > 0 ? m_hashPadBytes : 32;
+        std::vector<uint8> nBytes = N.AsByteArray(pad);
+        std::vector<uint8> gBytes = g.AsByteArray(pad);
+        Crypto::Hash::SHA1::Generator gen;
+        gen.UpdateData(nBytes.data(), nBytes.size());
+        gen.UpdateData(gBytes.data(), gBytes.size());
+        auto kHash = gen.GetDigest();
+        BigNumber k;
+        k.SetBinary(kHash.data(), kHash.size());
+        B = ((v * k) + gmod) % N;
+    }
+    else
+    {
+        // Classic WoW: constant multiplier 3
+        B = ((v * 3) + gmod) % N;
+    }
 
     MANGOS_ASSERT(gmod.GetNumBytes() <= 32);
 }
@@ -45,8 +63,20 @@ void SRP6::CalculateProof(std::string username)
 {
     using namespace Crypto::Hash;
 
-    SHA1::Digest hashN = SHA1::ComputeFrom(N);
-    auto hashG = SHA1::ComputeFrom(g);
+    SHA1::Digest hashN;
+    SHA1::Digest hashG;
+    if (m_hashPadBytes > 0)
+    {
+        auto nBytes = N.AsByteArray(m_hashPadBytes);
+        auto gBytes = g.AsByteArray(m_hashPadBytes);
+        hashN = SHA1::ComputeFrom(nBytes.data(), nBytes.size());
+        hashG = SHA1::ComputeFrom(gBytes.data(), gBytes.size());
+    }
+    else
+    {
+        hashN = SHA1::ComputeFrom(N);
+        hashG = SHA1::ComputeFrom(g);
+    }
     for (int i = 0; i < 20; ++i)
     {
         hashN[i] ^= hashG[i];
@@ -58,8 +88,18 @@ void SRP6::CalculateProof(std::string username)
     generator.UpdateData(t3);
     generator.UpdateData(SHA1::ComputeFrom(username));
     generator.UpdateData(s);
-    generator.UpdateData(A);
-    generator.UpdateData(B);
+    if (m_hashPadBytes > 0)
+    {
+        auto aBytes = A.AsByteArray(m_hashPadBytes);
+        auto bBytes = B.AsByteArray(m_hashPadBytes);
+        generator.UpdateData(aBytes.data(), aBytes.size());
+        generator.UpdateData(bBytes.data(), bBytes.size());
+    }
+    else
+    {
+        generator.UpdateData(A);
+        generator.UpdateData(B);
+    }
     generator.UpdateData(K);
     SHA1::Digest hashM = generator.GetDigest();
 
@@ -78,8 +118,18 @@ bool SRP6::CalculateSessionKey(uint8 const* lp_A, int l)
         return false;
 
     Crypto::Hash::SHA1::Generator generator;
-    generator.UpdateData(A);
-    generator.UpdateData(B);
+    if (m_hashPadBytes > 0)
+    {
+        auto aBytes = A.AsByteArray(m_hashPadBytes);
+        auto bBytes = B.AsByteArray(m_hashPadBytes);
+        generator.UpdateData(aBytes.data(), aBytes.size());
+        generator.UpdateData(bBytes.data(), bBytes.size());
+    }
+    else
+    {
+        generator.UpdateData(A);
+        generator.UpdateData(B);
+    }
     u.SetBinary(generator.GetDigest().data(), 20);
 
     S = (A * (v.ModExp(u, N))).ModExp(b, N);
@@ -195,5 +245,13 @@ bool SRP6::SetVerifier(const char* new_v)
 {
     if (v.SetHexStr(new_v) == 0 || v.isZero())
         return false;
+    return true;
+}
+
+bool SRP6::SetParameters(char const* primeHex, uint32 generator)
+{
+    if (!primeHex || N.SetHexStr(primeHex) == 0 || N.isZero())
+        return false;
+    g.SetDword(generator);
     return true;
 }

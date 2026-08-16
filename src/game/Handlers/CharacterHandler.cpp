@@ -23,6 +23,7 @@
 #include "Database/DatabaseEnv.h"
 #include "WorldPacket.h"
 #include "SharedDefines.h"
+#include "ClientDefines.h"
 #include "WorldSession.h"
 #include "Opcodes.h"
 #include "Log.h"
@@ -117,6 +118,7 @@ public:
         WorldSession* session = sWorld.FindSession(account);
         if (!session)
         {
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "HandleCharEnumCallback: session for account %u not in world map yet", account);
             return;
         }
         session->HandleCharEnum(std::move(result));
@@ -136,37 +138,10 @@ public:
     }
 } chrHandler;
 
-void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
-{
-    WorldPacket data(SMSG_CHAR_ENUM, 100);                  // we guess size
-
-    uint8 num = 0;
-    data << num;
-
-    if (result)
-    {
-        do
-        {
-            uint32 guidlow = (*result)[0].GetUInt32();
-            uint32 level   = (*result)[10].GetUInt32();
-            if (m_characterMaxLevel < level)
-                m_characterMaxLevel = level;
-
-            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL, "Build enum data for char guid %u from account %u.", guidlow, GetAccountId());
-            if (Player::BuildEnumData(result, &data))
-                ++num;
-        }
-        while (result->NextRow());
-    }
-
-    data.put<uint8>(0, num);
-    m_charactersCount = num;
-
-    SendPacket(&data);
-}
-
 void WorldSession::HandleCharEnumOpcode(NullClientPacket const& /*packet*/)
 {
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "CMSG_CHAR_ENUM from account %u", GetAccountId());
+
     // get all the data necessary for loading all characters (along with their pets) on the account
     CharacterDatabase.AsyncPQuery(&chrHandler, &CharacterHandler::HandleCharEnumCallback, GetAccountId(),
                                   //           0                    1                    2                    3                     4                      5                    6                    7                          8                          9                           10
@@ -180,6 +155,64 @@ void WorldSession::HandleCharEnumOpcode(NullClientPacket const& /*packet*/)
                                   "WHERE `characters`.`account` = '%u' ORDER BY `characters`.`create_time`, `characters`.`guid` "
                                   "LIMIT 0,10",
                                   PET_SAVE_AS_CURRENT, GetAccountId());
+}
+
+void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
+{
+    WorldPacket data(SMSG_CHAR_ENUM, 100);                  // we guess size
+
+    uint8 num = 0;
+    data << num;
+
+    bool const azrt = GetPlatform() == CLIENT_PLATFORM_X64;
+
+    if (result)
+    {
+        do
+        {
+            uint32 guidlow = (*result)[0].GetUInt32();
+            uint32 level   = (*result)[10].GetUInt32();
+            if (m_characterMaxLevel < level)
+                m_characterMaxLevel = level;
+
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL, "Build enum data for char guid %u from account %u.", guidlow, GetAccountId());
+            // UOA: client speaks vanilla 1.12 char-list body; only C->S opcodes are renumbered.
+            if (Player::BuildEnumData(result, &data, false))
+                ++num;
+        }
+        while (result->NextRow());
+    }
+
+    data.put<uint8>(0, num);
+    m_charactersCount = num;
+
+    // Emberveil S->C char-list is NOT vanilla 0x3B.
+    // Handler table base = object+0x6d0, stride 0x18; list reader 0x14493c730 is installed at
+    // +0x7210 => opcode (0x7210-0x6d0)/0x18 = 0x478. Slot 0x3B stays the default stub.
+    // (0x271 is scene-load; UOA default 0x3B matches mangos wire, not this client's table.)
+    if (azrt)
+    {
+        data.SetOpcode(static_cast<uint16>(0x478));
+        MarkAzrtCharEnumFullSent();
+    }
+
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "SMSG_CHAR_ENUM account=%u chars=%u size=%u opcode=%u (0x%X)",
+             GetAccountId(), uint32(num), uint32(data.size()),
+             uint32(data.GetOpcode()), uint32(data.GetOpcode()));
+    if (azrt)
+    {
+        std::string hex;
+        hex.reserve(data.size() * 3);
+        for (size_t i = 0; i < data.size(); ++i)
+        {
+            char b[4];
+            snprintf(b, sizeof(b), "%02X ", data[i]);
+            hex += b;
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "SMSG_CHAR_ENUM AZRT body[%u]: %s",
+                 uint32(data.size()), hex.c_str());
+    }
+    SendPacket(&data);
 }
 
 void WorldSession::HandleCharCreateOpcode(WorldPackets::Character::CharCreate const& packet)
@@ -391,6 +424,13 @@ void WorldSession::HandlePlayerLoginOpcode(WorldPackets::Character::PlayerLogin 
 void WorldSession::LoginPlayer(ObjectGuid loginPlayerGuid)
 {
     ASSERT(loginPlayerGuid.IsPlayer());
+    if (PlayerLoading() || GetPlayer() != nullptr)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSession: AZRT skip duplicate PLAYER_LOGIN guid=%u loading=%u hasPlayer=%u",
+                 loginPlayerGuid.GetCounter(), m_playerLoading ? 1u : 0u, GetPlayer() ? 1u : 0u);
+        return;
+    }
     LoginQueryHolder* holder = new LoginQueryHolder(GetAccountId(), loginPlayerGuid);
     if (!holder->Initialize())
     {
@@ -574,7 +614,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
     pCurrChar->SendInitialPacketsBeforeAddToMap();
     GetMasterPlayer()->SendInitialActionButtons();
 
-    // Show cinematic at the first time that player login
+    // Show cinematic at the first time that player login.
+    // Emberveil: 0xFA id=1 is an intro skybox (no terrain). Do not force it every AZRT login.
     if (pCurrChar->m_playedTime[PLAYED_TIME_TOTAL] == 0 && !sWorld.getConfig(CONFIG_BOOL_SKIP_CINEMATICS))
     {
         if (ChrRacesEntry const* rEntry = sChrRacesStore.LookupEntry(pCurrChar->GetRace()))

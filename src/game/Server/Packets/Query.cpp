@@ -8,8 +8,17 @@ void WorldPackets::Query::QueryPlayerName::ReadFromWorldPacket(WorldPacket& recv
 
 void WorldPackets::Query::QueryCreature::ReadFromWorldPacket(WorldPacket& recv_data)
 {
+    if (recv_data.size() - recv_data.rpos() < 4)
+    {
+        entry = 0;
+        guid.Clear();
+        return;
+    }
     recv_data >> entry;
-    recv_data >> guid;
+    if (recv_data.size() - recv_data.rpos() >= 8)
+        recv_data >> guid;
+    else
+        guid.Clear();
 }
 
 void WorldPackets::Query::QueryGameObject::ReadFromWorldPacket(WorldPacket& recv_data)

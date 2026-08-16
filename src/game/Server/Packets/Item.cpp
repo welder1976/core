@@ -65,6 +65,9 @@ void WorldPackets::Item::DestroyItem::ReadFromWorldPacket(WorldPacket& recv_data
     recv_data >> data1;
     recv_data >> data2;
     recv_data >> data3;
+    // Emberveil / some custom clients append 2 extra bytes
+    while (recv_data.rpos() < recv_data.size())
+        recv_data.read_skip<uint8>();
 }
 
 void WorldPackets::Item::AutoBankItem::ReadFromWorldPacket(WorldPacket& recv_data)

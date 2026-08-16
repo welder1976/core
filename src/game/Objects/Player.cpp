@@ -1626,7 +1626,7 @@ void Player::AutoReSummonPet()
 }
 
 
-bool Player::BuildEnumData(const std::unique_ptr<QueryResult>& result, WorldPacket* pData)
+bool Player::BuildEnumData(const std::unique_ptr<QueryResult>& result, WorldPacket* pData, bool azrtZeroGear)
 {
     //                0                1                2                3                 4                  5                6                7                      8                      9                       10
     //    "SELECT characters.guid, characters.name, characters.race, characters.class, characters.gender, characters.skin, characters.face, characters.hair_style, characters.hair_color, characters.facial_hair, characters.level, "
@@ -1648,23 +1648,19 @@ bool Player::BuildEnumData(const std::unique_ptr<QueryResult>& result, WorldPack
         return false;
     }
 
+    // Emberveil RE (0x144924240), lich=0 => +0x640 clear => classic vanilla wire.
     *pData << ObjectGuid(HIGHGUID_PLAYER, guid);
+
     *pData << fields[1].GetString();                       // name
     *pData << uint8(pRace);                                // race
     *pData << uint8(pClass);                               // class
     *pData << uint8(fields[4].GetUInt8());                 // gender
 
-    uint8 skin = fields[5].GetUInt8();
-    uint8 face = fields[6].GetUInt8();
-    uint8 hairStyle = fields[7].GetUInt8();
-    uint8 hairColor = fields[8].GetUInt8();
-    *pData << uint8(skin);                                 // skin
-    *pData << uint8(face);                                 // face
-    *pData << uint8(hairStyle);                            // hair style
-    *pData << uint8(hairColor);                            // hair color
-
-    uint8 facialHair = fields[9].GetUInt8();
-    *pData << uint8(facialHair);                           // facial hair
+    *pData << uint8(fields[5].GetUInt8());                 // skin
+    *pData << uint8(fields[6].GetUInt8());                 // face
+    *pData << uint8(fields[7].GetUInt8());                 // hair style
+    *pData << uint8(fields[8].GetUInt8());                 // hair color
+    *pData << uint8(fields[9].GetUInt8());                 // facial hair
 
     *pData << uint8(fields[10].GetUInt8());                // level
     *pData << uint32(fields[11].GetUInt32());              // zone
@@ -1679,17 +1675,14 @@ bool Player::BuildEnumData(const std::unique_ptr<QueryResult>& result, WorldPack
     uint32 charFlags = fields[17].GetUInt32();
     *pData << uint32(charFlags);                           // character flags
 
-    // First login
     uint32 totalPlayedTime = fields[18].GetUInt32();
     *pData << uint8(totalPlayedTime != 0 ? 0 : 1);
 
-    // Pets info
     {
         uint32 petDisplayId = 0;
         uint32 petLevel = 0;
         uint32 petFamily = 0;
 
-        // show pet at selection character in character list only for non-ghost character
         if (result && !(charFlags & CHARACTER_FLAG_GHOST) && (pClass == CLASS_WARLOCK || pClass == CLASS_HUNTER))
         {
             uint32 entry = fields[19].GetUInt32();
@@ -1707,14 +1700,13 @@ bool Player::BuildEnumData(const std::unique_ptr<QueryResult>& result, WorldPack
         *pData << uint32(petFamily);
     }
 
-
     Tokens data = StrSplit(fields[22].GetCppString(), " ");
     for (uint8 slot = 0; slot < INVENTORY_SLOT_BAG_START + 1; slot++)
     {
-        uint32 visualbase = slot * 2;                       // entry, perm ench., temp ench.
+        uint32 visualbase = slot * 2;
         uint32 itemId = GetUInt32ValueFromArray(data, visualbase);
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
-        if (!proto)
+        if (azrtZeroGear || !proto)
         {
             *pData << uint32(0);
             *pData << uint8(0);

@@ -32,6 +32,8 @@
 #include "Opcodes.h"
 #include "WorldSession.h"
 #include "WorldPacket.h"
+#include "Packet.h"
+#include "ClientDefines.h"
 #include "Weather.h"
 #include "Player.h"
 #include "TransactionLog.h"
@@ -321,7 +323,8 @@ void World::AddSession_(WorldSession* s)
         return;
     }
 
-    // Checked for 1.12.2
+    // Checked for 1.12.2 — keep classic AUTH_OK layout for Emberveil (no expansion byte).
+    // An extra expansion field shifts the client's decrypt stream and breaks SMSG_CHAR_ENUM.
     WorldPacket packet(SMSG_AUTH_RESPONSE, 1 + 4 + 1 + 4);
     packet << uint8(AUTH_OK);
     packet << uint32(0);                                    // BillingTimeRemaining
@@ -332,10 +335,19 @@ void World::AddSession_(WorldSession* s)
 #endif
     s->SendPacket(&packet);
 
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "World::AddSession_: AUTH_OK sent to account %u platform=%u",
+             s->GetAccountId(), uint32(s->GetPlatform()));
+
+    // AZRT: do not push CHAR_ENUM here — wait for client's empty opcode 96 poll so the
+    // client is in CHAR_LIST_RETRIEVING and ready to accept the response.
+
     UpdateMaxSessionCounters();
 
     // Only init warden after session has been added
-    s->InitWarden();
+    if (s->GetPlatform() != CLIENT_PLATFORM_X64)
+        s->InitWarden();
+    else
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "World::AddSession_: skipping Warden for AZRT account %u", s->GetAccountId());
 
     // Updates the population
     if (playerLimit > 0)

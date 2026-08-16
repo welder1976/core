@@ -32,6 +32,7 @@
 #include "IO/Filesystem/FileHandle.h"
 #include "Policies/ObjectConstructorTraits.h"
 #include "AuthPackets.h"
+#include "AuthCodes.h"
 #include <functional>
 
 enum LockFlag
@@ -136,6 +137,14 @@ class AuthSocket : public std::enable_shared_from_this<AuthSocket>, MaNGOS::Poli
         // between enUS and enGB, which is important for the patch system
         std::string m_localizationName;
         uint16 m_build = 0;
+
+        // Emberveil / Unreal Azeroth clients speak AZRT opcodes (0xA0+)
+        bool m_azrtClient = false;
+        uint8 AuthChallengeCmd() const { return m_azrtClient ? CMD_AUTH_AZRT_LOGON_CHALLENGE : CMD_AUTH_LOGON_CHALLENGE; }
+        uint8 AuthProofCmd() const { return m_azrtClient ? CMD_AUTH_AZRT_PROOF_RESP : CMD_AUTH_LOGON_PROOF; }
+        uint8 AuthReconnectChallengeCmd() const { return m_azrtClient ? CMD_AUTH_AZRT_CHALLENGE_RESP : CMD_AUTH_RECONNECT_CHALLENGE; }
+        uint8 AuthReconnectProofCmd() const { return m_azrtClient ? CMD_AUTH_AZRT_PROOF_RESP : CMD_AUTH_RECONNECT_PROOF; }
+        uint8 RealmListCmd() const { return m_azrtClient ? CMD_AUTH_AZRT_REALM_LIST_RESP : CMD_REALM_LIST; }
 
         AccountTypes GetSecurityOn(uint32 realmId) const;
         void LoadAccountSecurityLevels(uint32 accountId);

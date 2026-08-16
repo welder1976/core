@@ -174,7 +174,7 @@ Handlers BuildOpcodeList()
     INVALID_PACKET(SMSG_QUEST_QUERY_RESPONSE,         UnhandleReason::SendByServer);
     DEFINE_HANDLER(CMSG_GAMEOBJECT_QUERY,             STATUS_LOGGEDIN,  PACKET_PROCESS_DB_QUERY,      &WorldSession::HandleGameObjectQueryOpcode);
     INVALID_PACKET(SMSG_GAMEOBJECT_QUERY_RESPONSE,    UnhandleReason::SendByServer);
-    DEFINE_HANDLER(CMSG_CREATURE_QUERY,               STATUS_LOGGEDIN,  PACKET_PROCESS_DB_QUERY,      &WorldSession::HandleCreatureQueryOpcode);
+    DEFINE_HANDLER(CMSG_CREATURE_QUERY,               STATUS_AUTHED,    PACKET_PROCESS_DB_QUERY,      &WorldSession::HandleCreatureQueryOpcode);
     INVALID_PACKET(SMSG_CREATURE_QUERY_RESPONSE,      UnhandleReason::SendByServer);
     DEFINE_HANDLER(CMSG_WHO,                          STATUS_LOGGEDIN,  PACKET_PROCESS_WORLD,         &WorldSession::HandleWhoOpcode);
     INVALID_PACKET(SMSG_WHO,                          UnhandleReason::SendByServer);

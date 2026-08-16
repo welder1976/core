@@ -43,8 +43,12 @@
 #include "MasterPlayer.h"
 #include "PlayerBroadcaster.h"
 #include "Crypto/Hash/MD5.h"
+#include "UpdateData.h"
 
+#include <cstdio>
 #include <limits>
+#include <string>
+#include <zlib.h>
 
 // select opcodes appropriate for processing in Map::Update context for current session state
 static bool MapSessionFilterHelper(WorldSession* session, OpcodeHandler const& opHandle)
@@ -199,7 +203,199 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
 
 #endif // _DEBUG
 
-    // sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[%s]Send packet : %u|0x%x (%s)", GetPlayerName(), packet->GetOpcode(), packet->GetOpcode(), LookupOpcodeName(packet->GetOpcode()));
+    // AZRT/x64: drop unsafe classic bodies, remap S->C opcodes the client actually hooks.
+    if (GetPlatform() == CLIENT_PLATFORM_X64)
+    {
+        uint16 op = packet->GetOpcode();
+        switch (op)
+        {
+            case SMSG_MONSTER_MOVE:
+            case SMSG_MONSTER_MOVE_TRANSPORT:
+            case SMSG_SPELL_START:
+            case SMSG_SPELL_GO:
+            case SMSG_SPLINE_MOVE_ROOT:
+            case SMSG_SPLINE_MOVE_UNROOT:
+            case SMSG_SPLINE_MOVE_FEATHER_FALL:
+            case SMSG_SPLINE_MOVE_NORMAL_FALL:
+            case SMSG_SPLINE_MOVE_SET_HOVER:
+            case SMSG_SPLINE_MOVE_UNSET_HOVER:
+            case SMSG_SPLINE_MOVE_WATER_WALK:
+            case SMSG_SPLINE_MOVE_LAND_WALK:
+            case SMSG_SPLINE_MOVE_START_SWIM:
+            case SMSG_SPLINE_MOVE_STOP_SWIM:
+            case SMSG_SPLINE_MOVE_SET_RUN_MODE:
+            case SMSG_SPLINE_MOVE_SET_WALK_MODE:
+                sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                         "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (classic body unsafe)",
+                         uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
+                return;
+            default:
+                break;
+        }
+
+        // Handler-table RE (object+0x6d0, stride 0x18), Emberveil:
+        //   0x17D VERIFY: u32 mapId -> LoadMap. Do not send xyz here.
+        //   0xC5  map + xyz + orient: writes +0x480 THEN OpenLevel (same 0x1449283F0
+        //         as 0x271) if the map id is in the client DB. That unloads the world
+        //         0x17D just loaded — do not send it after VERIFY.
+        //   0x2D7 packed game time (vanilla SETTIMESPEED bits)
+        //   0xFA  cinematic u32 in {1,2,3}; 1=intro void, 2=UI, 3=stop
+        //   0x1FC zlib classic UpdateData (spawn)
+        uint16 sendOp = op;
+
+        if (op == SMSG_DESTROY_OBJECT)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                     "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (destroy opcode unknown)",
+                     uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
+            return;
+        }
+
+        WorldPacket sendPacket;
+        if (op == SMSG_TRIGGER_CINEMATIC)
+        {
+            sendOp = 0xFA;
+            sendPacket.Initialize(sendOp, 4);
+            sendPacket << uint32(2); // Emberveil: 1=intro void, 2=UI, 3=stop
+        }
+        else if (op == SMSG_COMPRESSED_UPDATE_OBJECT || op == SMSG_UPDATE_OBJECT)
+        {
+            // Send a player-only create first (no items). Then still remap the
+            // original update so NPCs/GOs keep spawning.
+            if (!m_azrtSendingSelfCreate && !m_azrtSelfCreateSent && GetPlayer())
+            {
+                m_azrtSelfCreateSent = true;
+                m_azrtSendingSelfCreate = true;
+                UpdateData selfData;
+                GetPlayer()->Unit::BuildCreateUpdateBlockForPlayer(selfData, GetPlayer());
+                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                         "WorldSession: AZRT inject player-only self-create guid=%u display=%u native=%u race=%u class=%u gender=%u bytes0=0x%X before mixed update size=%u",
+                         GetPlayer()->GetGUIDLow(),
+                         GetPlayer()->GetDisplayId(),
+                         GetPlayer()->GetNativeDisplayId(),
+                         uint32(GetPlayer()->GetRace()),
+                         uint32(GetPlayer()->GetClass()),
+                         uint32(GetPlayer()->GetGender()),
+                         GetPlayer()->GetUInt32Value(UNIT_FIELD_BYTES_0),
+                         uint32(packet->size()));
+                selfData.Send(this, false);
+                m_azrtSendingSelfCreate = false;
+            }
+
+            if (op == SMSG_COMPRESSED_UPDATE_OBJECT)
+            {
+                sendOp = 0x1FC;
+                sendPacket = WorldPacket(*packet);
+                sendPacket.SetOpcode(sendOp);
+            }
+            else
+            {
+                sendOp = 0x1FC;
+                size_t const pSize = packet->size();
+                uint32 destsize = compressBound(static_cast<uLong>(pSize));
+                sendPacket.Initialize(sendOp, destsize + sizeof(uint32));
+                sendPacket.resize(destsize + sizeof(uint32));
+                sendPacket.put<uint32>(0, uint32(pSize));
+                PacketCompressor::Compress(const_cast<uint8*>(sendPacket.contents()) + sizeof(uint32),
+                                           &destsize,
+                                           const_cast<uint8*>(packet->contents()),
+                                           int(pSize));
+                if (destsize == 0)
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                             "WorldSession: AZRT UPDATE_OBJECT compress failed size=%u",
+                             uint32(pSize));
+                    return;
+                }
+                sendPacket.resize(destsize + sizeof(uint32));
+            }
+        }
+        else
+        {
+            sendPacket = WorldPacket(*packet);
+            if (op == SMSG_LOGIN_VERIFY_WORLD)
+            {
+                // 0x17D: u32 mapId -> LoadMap.
+                sendOp = 0x17D;
+                uint32 mapId = 0;
+                if (packet->size() >= 4)
+                    memcpy(&mapId, packet->contents(), sizeof(mapId));
+                sendPacket.Initialize(sendOp, 4);
+                sendPacket << mapId;
+            }
+            else if (op == SMSG_LOGIN_SETTIMESPEED)
+            {
+                sendOp = 0x2D7;
+                sendPacket.SetOpcode(sendOp);
+            }
+            else if (op == SMSG_NEW_WORLD)
+            {
+                // 0xC5 OpenLevels; a teleport must not use it until we have a
+                // no-reload origin packet. Drop for now (same as unknown SMSG).
+                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                         "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (NEW_WORLD would OpenLevel)",
+                         uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
+                return;
+            }
+        }
+
+        if (sendOp != op)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                     "WorldSession: AZRT REMAP_SMSG %u (0x%X/%s) -> %u (0x%X) size=%u",
+                     uint32(op), uint32(op), LookupOpcodeName(op),
+                     uint32(sendOp), uint32(sendOp), uint32(sendPacket.size()));
+        }
+
+        if ((sendOp != 0x1FC && (!GetPlayer() || sendPacket.size() <= 64)) ||
+            op == SMSG_AUTH_RESPONSE || op == SMSG_LOGIN_VERIFY_WORLD ||
+            op == SMSG_CHAR_ENUM || op == SMSG_TRIGGER_CINEMATIC ||
+            op == SMSG_LOGIN_SETTIMESPEED || op == 0x478 ||
+            sendOp == 0x17D || sendOp == 0xFA || sendOp == 0x2D7)
+        {
+            char const* name = LookupOpcodeName(op);
+            size_t const n = std::min<size_t>(sendPacket.size(), 256);
+            std::string hex;
+            hex.reserve(n * 3 + 8);
+            for (size_t i = 0; i < n; ++i)
+            {
+                char b[4];
+                std::snprintf(b, sizeof(b), "%02X ", sendPacket[i]);
+                hex += b;
+            }
+            if (sendPacket.size() > 256)
+                hex += "...";
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                     "WorldSession: AZRT SMSG opcode=%u (0x%X) wire=%u (0x%X) name=%s size=%u account=%u player=%u body[%u]: %s",
+                     uint32(op), uint32(op), uint32(sendOp), uint32(sendOp), name ? name : "?",
+                     uint32(sendPacket.size()), GetAccountId(), GetPlayer() ? 1u : 0u,
+                     uint32(sendPacket.size()),
+                     sendPacket.empty() ? "(empty)" : hex.c_str());
+        }
+
+        if (m_sniffFile)
+            m_sniffFile->WritePacket(sendPacket, false, time(nullptr));
+
+        m_socket->SendPacket(sendPacket);
+
+        // Char-select leaves Emberveil in 0xFA id=2 (UI). Self-pawn spawn
+        // (14486CE30 / SpawnActor) runs after 0x1FC; it needs world mode.
+        // 0xFA id=3 = stop. VERIFY is sent before AddToMap/0x1FC.
+        if (sendOp == 0x17D && !m_azrtCinematicStopSent)
+        {
+            m_azrtCinematicStopSent = true;
+            WorldPacket stopUi(0xFA, 4);
+            stopUi << uint32(3);
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                     "WorldSession: AZRT SMSG wire=0xFA cinematic-stop=3 after VERIFY map=%u",
+                     sendPacket.size() >= 4 ? sendPacket.read<uint32>(0) : 0u);
+            if (m_sniffFile)
+                m_sniffFile->WritePacket(stopUi, false, time(nullptr));
+            m_socket->SendPacket(stopUi);
+        }
+        return;
+    }
+
     if (m_sniffFile)
         m_sniffFile->WritePacket(*packet, false, time(nullptr));
 
@@ -346,7 +542,8 @@ void WorldSession::QueueBinaryPacket(std::unique_ptr<WorldPacket> const& binaryP
     {
         if (m_socket)
         {
-            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[%s] Received unhandled opcode %s (0x%.4X) will be skipped", m_socket->GetRemoteIpString().c_str(), opHandle.name, binaryPacket->GetOpcode());
+            LogLevel const lvl = (GetPlatform() == CLIENT_PLATFORM_X64) ? LOG_LVL_DETAIL : LOG_LVL_ERROR;
+            sLog.Out(LOG_BASIC, lvl, "[%s] Received unhandled opcode %s (0x%.4X) will be skipped", m_socket->GetRemoteIpString().c_str(), opHandle.name, binaryPacket->GetOpcode());
         }
         else
         {
@@ -840,6 +1037,9 @@ void WorldSession::LogoutPlayer(bool Save)
 #endif
 
         SetPlayer(nullptr);                                    // deleted in Remove/DeleteFromWorld call
+        m_azrtSelfCreateSent = false;
+        m_azrtSendingSelfCreate = false;
+        m_azrtCinematicStopSent = false;
 
         // Send the 'logout complete' packet to the client
         SendPacket(std::make_unique<WorldPackets::Misc::LogoutComplete>());
