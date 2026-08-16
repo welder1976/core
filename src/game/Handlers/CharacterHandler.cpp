@@ -37,6 +37,7 @@
 #include "Database/DatabaseImpl.h"
 #include "SocialMgr.h"
 #include "Util.h"
+#include "Config/Config.h"
 #include "Language.h"
 #include "Anticheat.h"
 #include "MasterPlayer.h"
@@ -194,6 +195,18 @@ void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
     {
         data.SetOpcode(static_cast<uint16>(0x478));
         MarkAzrtCharEnumFullSent();
+
+        // Emberveil lich=0: after the vanilla enum body the client requires 32 more
+        // bytes (AZCT slot-1 AES key). Remaining < 32 => "Character list is incomplete."
+        uint8 azrtEnumKey[32] = {};
+        std::string keyHex = sConfig.GetStringDefault("Azrt.IntegrityKey", "");
+        if (keyHex.size() == 64)
+            HexStrToByteArray(keyHex, azrtEnumKey);
+        else if (!keyHex.empty())
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "SMSG_CHAR_ENUM Azrt.IntegrityKey must be 64 hex chars, got %u",
+                     uint32(keyHex.size()));
+        data.append(azrtEnumKey, sizeof(azrtEnumKey));
     }
 
     sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "SMSG_CHAR_ENUM account=%u chars=%u size=%u opcode=%u (0x%X)",
