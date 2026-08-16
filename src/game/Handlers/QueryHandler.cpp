@@ -30,6 +30,7 @@
 #include "ObjectMgr.h"
 #include "ObjectGuid.h"
 #include "Player.h"
+#include "CreatureDefines.h"
 
 void WorldSession::SendNameQueryOpcode(Player* p)
 {
@@ -113,6 +114,61 @@ void WorldSession::HandleQueryTimeOpcode(NullClientPacket const& /*packet*/)
 void WorldSession::HandleCreatureQueryOpcode(WorldPackets::Query::QueryCreature const& packet)
 {
     CreatureInfo const* ci = sObjectMgr.GetCreatureTemplate(packet.entry);
+    if (GetPlatform() == CLIENT_PLATFORM_X64)
+    {
+        // Official Emberveil 0x509 @ 0x14494E520:
+        //   entry, type, displayId, name\0, u8×3, u32×31, subname\0, u32×14
+        WorldPacket data(SMSG_CREATURE_QUERY_RESPONSE);
+        if (!ci)
+        {
+            data << (packet.entry | 0x80000000);
+            SendPacket(&data);
+            return;
+        }
+        std::string const* name = &ci->name;
+        int const locIdx = GetSessionDbLocaleIndex();
+        if (locIdx >= 0)
+        {
+            if (CreatureLocale const* loc = sObjectMgr.GetCreatureLocale(ci->entry))
+            {
+                if (loc->Name.size() > static_cast<size_t>(locIdx) && !loc->Name[locIdx].empty())
+                    name = &loc->Name[locIdx];
+            }
+        }
+        data << ci->entry;
+        data << uint32(ci->type);
+        data << uint32(ci->display_id[0]);
+        data << *name;
+        data << uint8(ci->civilian);
+        data << uint8(ci->racial_leader);
+        data << uint8(0);
+        // Official parser @ 0x14494E520: after name/u8×3 expects u32×31, cstr, u32×14.
+        data << uint32(ci->static_flags1);
+        data << uint32(ci->pet_family);
+        data << uint32(ci->rank);
+        data << uint32(0);
+        data << uint32(ci->pet_spell_list_id);
+        for (uint32 i = 1; i < MAX_DISPLAY_IDS_PER_CREATURE; ++i)
+            data << uint32(ci->display_id[i]);
+        for (uint32 i = 0; i < 23; ++i) // 5+3+23 = 31
+            data << uint32(0);
+        {
+            std::string const* subName = &ci->subname;
+            if (locIdx >= 0)
+            {
+                if (CreatureLocale const* loc = sObjectMgr.GetCreatureLocale(ci->entry))
+                {
+                    if (loc->SubName.size() > static_cast<size_t>(locIdx) && !loc->SubName[locIdx].empty())
+                        subName = &loc->SubName[locIdx];
+                }
+            }
+            data << *subName;
+        }
+        for (uint32 i = 0; i < 14; ++i)
+            data << uint32(0);
+        SendPacket(&data);
+        return;
+    }
     if (ci)
     {
         auto response = std::make_unique<WorldPackets::Query::CreatureQueryResponse>();
@@ -134,6 +190,37 @@ void WorldSession::HandleCreatureQueryOpcode(WorldPackets::Query::QueryCreature 
 void WorldSession::HandleGameObjectQueryOpcode(WorldPackets::Query::QueryGameObject const& packet)
 {
     GameObjectInfo const* info = sObjectMgr.GetGameObjectTemplate(packet.entryID);
+    if (GetPlatform() == CLIENT_PLATFORM_X64)
+    {
+        // Official Emberveil 0x04F @ 0x14494D7A0:
+        //   entry, type, displayId, name\0, u32, raw[24×u32]
+        // (no name2-4 / icon string — those crash the client)
+        WorldPacket data(SMSG_GAMEOBJECT_QUERY_RESPONSE);
+        if (!info)
+        {
+            data << (packet.entryID | 0x80000000);
+            SendPacket(&data);
+            return;
+        }
+        std::string const* name = &info->name;
+        int const locIdx = GetSessionDbLocaleIndex();
+        if (locIdx >= 0)
+        {
+            if (GameObjectLocale const* loc = sObjectMgr.GetGameObjectLocale(info->id))
+            {
+                if (loc->Name.size() > static_cast<size_t>(locIdx) && !loc->Name[locIdx].empty())
+                    name = &loc->Name[locIdx];
+            }
+        }
+        data << info->id;
+        data << info->type;
+        data << info->displayId;
+        data << *name;
+        data << uint32(0); // classic icon string → Emberveil u32
+        data.append(reinterpret_cast<uint8 const*>(info->raw.data), 24 * sizeof(uint32));
+        SendPacket(&data);
+        return;
+    }
     if (info)
     {
         auto response = std::make_unique<WorldPackets::Query::GameObjectQueryResponse>();

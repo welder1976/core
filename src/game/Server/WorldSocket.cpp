@@ -70,15 +70,6 @@ std::string AzrtPacketBodyHex(WorldPacket const& packet, size_t maxBytes = 256)
     return hex;
 }
 
-uint16 AzrtMapQueryOpcodeByEntry(uint32 entry)
-{
-    if (sObjectMgr.GetCreatureTemplate(entry))
-        return CMSG_CREATURE_QUERY;
-    if (sObjectMgr.GetGameObjectTemplate(entry))
-        return CMSG_GAMEOBJECT_QUERY;
-    return CMSG_ITEM_QUERY_SINGLE;
-}
-
 // Emberveil opcode N is only a classic CMSG when the name is CMSG_* and the
 // slot actually has a client handler. MSG_* are movement and must not be
 // queued with Emberveil bodies (would apply garbage position).
@@ -113,59 +104,37 @@ bool AzrtCanPassthroughClassicCmsg(uint16 opcode, size_t size)
 
 // Emberveil in-world CMSG remaps. Returns false to drop the packet.
 // Wire numbers collide with classic SMSG/CMSG ids — never queue an unmapped AZRT opcode.
-bool AzrtRemapInWorldCmsg(WorldPacket& packet)
+bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
 {
     uint16 const opcode = packet.GetOpcode();
     size_t const size = packet.size();
 
-    // Packed-looking 8-byte GUID: name/creature/GO query (HIGHGUID in last 2 bytes).
+    // Official TXT: 0x4FB ↔ SMSG 0x3CC (guid + u32). Never answer with 0x509.
     if (opcode == 0x4FB && size == 8)
     {
         ObjectGuid guid;
         packet >> guid;
-        if (guid.IsCreatureOrPet())
-        {
-            uint32 const entry = guid.GetEntry();
-            packet.Initialize(CMSG_CREATURE_QUERY, 12);
-            packet << entry << guid;
-            packet.rpos(0);
-            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                     "WorldSocket: AZRT 0x4FB -> CMSG_CREATURE_QUERY entry=%u guid=%s",
-                     entry, guid.GetString().c_str());
-            return true;
-        }
-        if (guid.IsGameObject() || guid.IsMOTransport() || guid.IsTransport())
-        {
-            packet.Initialize(CMSG_GAMEOBJECT_QUERY, 12);
-            packet << guid.GetEntry() << guid;
-            packet.rpos(0);
-            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                     "WorldSocket: AZRT 0x4FB -> CMSG_GAMEOBJECT_QUERY entry=%u",
-                     guid.GetEntry());
-            return true;
-        }
-        if (guid.IsPlayer())
-        {
-            packet.Initialize(CMSG_NAME_QUERY, 8);
-            packet << guid;
-            packet.rpos(0);
-            sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                     "WorldSocket: AZRT 0x4FB -> CMSG_NAME_QUERY guid=%u",
-                     guid.GetCounter());
-            return true;
-        }
-        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                 "WorldSocket: AZRT DROP_CMSG 0x4FB unknown guid %s",
+        if (session)
+            session->AzrtSendQueryName(guid);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT 0x4FB -> SMSG 0x3CC guid=%s",
                  guid.GetString().c_str());
-        return false;
+        return false; // consumed
     }
 
-    // entry + guid (12 bytes): creature / GO / item query.
+    // Official Frida 1:1 counts: 0x143↔0x04F(GO), 0x0DE↔0x509(creature), 0x05D↔0x294(item).
+    // Do not pick type by entry DB lookup — collisions remap the wrong query.
     if ((opcode == 0x5D || opcode == 0x143 || opcode == 0xDE) && size >= 4)
     {
         uint32 entry = 0;
         memcpy(&entry, packet.contents(), sizeof(entry));
-        uint16 const mapped = AzrtMapQueryOpcodeByEntry(entry);
+        uint16 mapped = CMSG_ITEM_QUERY_SINGLE;
+        if (opcode == 0x143)
+            mapped = CMSG_GAMEOBJECT_QUERY;
+        else if (opcode == 0xDE)
+            mapped = CMSG_CREATURE_QUERY;
+        else
+            mapped = CMSG_ITEM_QUERY_SINGLE; // 0x5D
         packet.SetOpcode(mapped);
         packet.rpos(0);
         sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
@@ -542,8 +511,13 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                         }
                         else if (m_Session->GetPlayer())
                         {
-                            if (!AzrtRemapInWorldCmsg(*packet))
+                            uint16 const wireOp = packet->GetOpcode();
+                            if (!AzrtRemapInWorldCmsg(*packet, m_Session))
+                            {
+                                if (wireOp == 0x103)
+                                    m_Session->AzrtContinueEnterWorld();
                                 return HandlerResult::Okay;
+                            }
                         }
                         else if (!m_Session->GetPlayer() && opcode != CMSG_PING &&
                                  opcode != CMSG_CHAR_CREATE && opcode != CMSG_CHAR_DELETE &&

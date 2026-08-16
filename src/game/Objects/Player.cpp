@@ -4202,6 +4202,12 @@ void Player::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
 {
     if (target == this)
     {
+        // Emberveil 0x1FC parser desyncs on ITEM creates (field mask). Skip items
+        // for the self packet only — nearby UNIT/GO creates are a separate update.
+        bool const azrtSelf = target->GetSession() &&
+            target->GetSession()->GetPlatform() == CLIENT_PLATFORM_X64;
+        if (!azrtSelf)
+        {
         for (int i = 0; i < EQUIPMENT_SLOT_END; ++i)
         {
             if (m_items[i] == nullptr)
@@ -4231,6 +4237,7 @@ void Player::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
                 continue;
 
             m_items[i]->BuildCreateUpdateBlockForPlayer(data, target);
+        }
         }
     }
 
@@ -6110,9 +6117,14 @@ void Player::SendDirectMessage(WorldPacket* data) const
 
 void Player::SendCinematicStart(uint32 CinematicSequenceId)
 {
-    auto packet = std::make_unique<WorldPackets::Misc::TriggerCinematic>();
-    packet->cinematicSequenceId = CinematicSequenceId;
-    GetSession()->SendPacket(std::move(packet));
+    // Emberveil: classic SMSG_TRIGGER_CINEMATIC (0xFA) is not in the live table.
+    // Wire probe rotates candidates after CMSG 0x103 (see AzrtProbeEnterWorldPackets).
+    if (GetSession()->GetPlatform() != CLIENT_PLATFORM_X64)
+    {
+        auto packet = std::make_unique<WorldPackets::Misc::TriggerCinematic>();
+        packet->cinematicSequenceId = CinematicSequenceId;
+        GetSession()->SendPacket(std::move(packet));
+    }
 
     CinematicStart(CinematicSequenceId);
 }

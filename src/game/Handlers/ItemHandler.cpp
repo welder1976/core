@@ -292,6 +292,27 @@ void WorldSession::HandleItemQuerySingleOpcode(WorldPackets::Item::QueryItem con
                 description = il->Description[loc_idx].c_str();
         }
     }
+
+    if (GetPlatform() == CLIENT_PLATFORM_X64)
+    {
+        // Official Emberveil 0x294 @ 0x14494CD70:
+        //   entry, name\0, desc\0, u32×6, u8×2  (no classic name2-4)
+        WorldPacket data(SMSG_ITEM_QUERY_SINGLE_RESPONSE);
+        data << pProto->ItemId;
+        data << name;
+        data << (description ? description : "");
+        data << uint32(pProto->Class);
+        data << uint32(pProto->Class == ITEM_CLASS_CONSUMABLE ? 0 : pProto->SubClass);
+        data << uint32(pProto->DisplayInfoID);
+        data << uint32(pProto->Quality);
+        data << uint32(pProto->Flags);
+        data << uint32(pProto->InventoryType);
+        data << uint8(0);
+        data << uint8(0);
+        SendPacket(&data);
+        return;
+    }
+
     // guess size
     WorldPacket data(SMSG_ITEM_QUERY_SINGLE_RESPONSE, 600);
     data << pProto->ItemId;

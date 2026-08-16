@@ -420,6 +420,10 @@ class WorldSession
         AccountData* GetAccountData(NewAccountData::AccountDataType type) { return &m_accountData[type]; }
         void SetAccountData(NewAccountData::AccountDataType type, const std::string& data);
         void SendAccountDataTimes();
+        // Emberveil: after CMSG 0x103 continue login (official TXT order).
+        void AzrtContinueEnterWorld();
+        // Official 0x4FB → SMSG 0x3CC (guid + u32), not creature-query/0x509.
+        void AzrtSendQueryName(ObjectGuid guid);
         void LoadGlobalAccountData();
         void LoadAccountData(std::unique_ptr<QueryResult> result, uint32 mask);
 
@@ -878,6 +882,9 @@ class WorldSession
         bool m_azrtSelfCreateSent = false;
         bool m_azrtSendingSelfCreate = false;
         bool m_azrtCinematicStopSent = false;
+        bool m_azrtAwaitingEnterAck = false;
+        bool m_azrtDeferredAlreadyOnline = false;
+        bool m_azrtStub2A7AfterBind = false;
         uint32 m_gameBuild;
         bool m_verifiedEmail;
         std::shared_ptr<PlayerBotEntry> m_bot;

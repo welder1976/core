@@ -572,13 +572,27 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
                              ? pCurrChar->m_movementInfo.GetTransportPos()
                              : pCurrChar->GetPosition();
 
+    // load player specific part before send times
+    LoadAccountData(holder->TakeResult(PLAYER_LOGIN_QUERY_LOADACCOUNTDATA), NewAccountData::PER_CHARACTER_CACHE_MASK);
+    // Official Emberveil: 0x2AC account slots before VERIFY (0xC5).
+    SendAccountDataTimes();
+
     auto loginVerifyWorld = std::make_unique<WorldPackets::Character::LoginVerifyWorld>();
     loginVerifyWorld->location = position.WithMapId(pCurrChar->GetMapId());
     SendPacket(std::move(loginVerifyWorld));
 
-    // load player specific part before send times
-    LoadAccountData(holder->TakeResult(PLAYER_LOGIN_QUERY_LOADACCOUNTDATA), NewAccountData::PER_CHARACTER_CACHE_MASK);
-    SendAccountDataTimes();
+    // Official Emberveil TXT: after VERIFY the client ACKs CMSG 0x103, then server
+    // sends 0x28E/0x313/0x13B/… then bind/spells/updates (0x1FC). Defer the rest.
+    if (GetPlatform() == CLIENT_PLATFORM_X64)
+    {
+        m_azrtAwaitingEnterAck = true;
+        m_azrtDeferredAlreadyOnline = alreadyOnline;
+        delete holder;
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSession: AZRT waiting CMSG 0x103 before enter-world guid=%u",
+                 pCurrChar->GetGUIDLow());
+        return;
+    }
 
     pCurrChar->GetSocial()->SendFriendList();
     pCurrChar->GetSocial()->SendIgnoreList();
@@ -631,7 +645,6 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
     GetMasterPlayer()->SendInitialActionButtons();
 
     // Show cinematic at the first time that player login.
-    // Emberveil: 0xFA id=1 is an intro skybox (no terrain). Do not force it every AZRT login.
     if (pCurrChar->m_playedTime[PLAYED_TIME_TOTAL] == 0 && !sWorld.getConfig(CONFIG_BOOL_SKIP_CINEMATICS))
     {
         if (ChrRacesEntry const* rEntry = sChrRacesStore.LookupEntry(pCurrChar->GetRace()))
