@@ -233,35 +233,33 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                 break;
         }
 
-        // Handler-table RE (object+0x6d0, stride 0x18), Emberveil:
-        //   0x17D VERIFY: u32 mapId -> LoadMap. Do not send xyz here.
-        //   0xC5  map + xyz + orient: writes +0x480 THEN OpenLevel (same 0x1449283F0
-        //         as 0x271) if the map id is in the client DB. That unloads the world
-        //         0x17D just loaded — do not send it after VERIFY.
-        //   0x2D7 packed game time (vanilla SETTIMESPEED bits)
-        //   0xFA  cinematic u32 in {1,2,3}; 1=intro void, 2=UI, 3=stop
-        //   0x1FC zlib classic UpdateData (spawn)
+        // Emberveil handler table (installer 0x14495D1B0): 0x528 slots, default stub
+        // 0x1410EAF20 (ret 0). Live SMSG only:
+        //   0x1EC AUTH_CHALLENGE (classic 492, sent on connect — do not resend)
+        //   0x1EE AUTH_RESPONSE  (classic 494, AUTH_OK=0x0C)
+        //   0x478 CHAR_ENUM
+        //   0x232 CHAR_CREATE    (u8, success=0x2E)
+        //   0x233 CHAR_DELETE    (u8, success=0x39)
+        //   0x3C3 CHAR_RENAME    (u8, then guid+name if 0)
+        //   0x216 login-failed / status u8
+        //   0x527 WORLD_ACCESS_STATUS (u8 granted=0, u32 extra) — world enter
+        //   0x1A4 AZCT empty probe (skip)
+        // 0x17D / 0xC5 / 0xFA / 0x1FC / 0x2D7 are stubs. 0x1EC after login
+        // makes the client send CMSG_AUTH_SESSION (0x1ED) again.
         uint16 sendOp = op;
 
-        if (op == SMSG_DESTROY_OBJECT)
+        if (op == SMSG_DESTROY_OBJECT || op == SMSG_NEW_WORLD ||
+            op == SMSG_TRIGGER_CINEMATIC || op == SMSG_LOGIN_SETTIMESPEED)
         {
             sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                     "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (destroy opcode unknown)",
+                     "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (no live Emberveil handler)",
                      uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
             return;
         }
 
         WorldPacket sendPacket;
-        if (op == SMSG_TRIGGER_CINEMATIC)
+        if (op == SMSG_COMPRESSED_UPDATE_OBJECT || op == SMSG_UPDATE_OBJECT)
         {
-            sendOp = 0xFA;
-            sendPacket.Initialize(sendOp, 4);
-            sendPacket << uint32(2); // Emberveil: 1=intro void, 2=UI, 3=stop
-        }
-        else if (op == SMSG_COMPRESSED_UPDATE_OBJECT || op == SMSG_UPDATE_OBJECT)
-        {
-            // Send a player-only create first (no items). Then still remap the
-            // original update so NPCs/GOs keep spawning.
             if (!m_azrtSendingSelfCreate && !m_azrtSelfCreateSent && GetPlayer())
             {
                 m_azrtSelfCreateSent = true;
@@ -282,15 +280,14 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                 m_azrtSendingSelfCreate = false;
             }
 
+            sendOp = 0x1FC;
             if (op == SMSG_COMPRESSED_UPDATE_OBJECT)
             {
-                sendOp = 0x1FC;
                 sendPacket = WorldPacket(*packet);
                 sendPacket.SetOpcode(sendOp);
             }
             else
             {
-                sendOp = 0x1FC;
                 size_t const pSize = packet->size();
                 uint32 destsize = compressBound(static_cast<uLong>(pSize));
                 sendPacket.Initialize(sendOp, destsize + sizeof(uint32));
@@ -310,33 +307,27 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                 sendPacket.resize(destsize + sizeof(uint32));
             }
         }
+        else if (op == SMSG_LOGIN_VERIFY_WORLD)
+        {
+            uint32 mapId = packet->size() >= 4 ? packet->read<uint32>(0) : 0u;
+            sendOp = 0x527; // WORLD_ACCESS_STATUS: u8=0 granted, u32 extra
+            sendPacket.Initialize(sendOp, 5);
+            sendPacket << uint8(0);
+            sendPacket << uint32(mapId);
+        }
         else
         {
             sendPacket = WorldPacket(*packet);
-            if (op == SMSG_LOGIN_VERIFY_WORLD)
-            {
-                // 0x17D: u32 mapId -> LoadMap.
-                sendOp = 0x17D;
-                uint32 mapId = 0;
-                if (packet->size() >= 4)
-                    memcpy(&mapId, packet->contents(), sizeof(mapId));
-                sendPacket.Initialize(sendOp, 4);
-                sendPacket << mapId;
-            }
-            else if (op == SMSG_LOGIN_SETTIMESPEED)
-            {
-                sendOp = 0x2D7;
-                sendPacket.SetOpcode(sendOp);
-            }
-            else if (op == SMSG_NEW_WORLD)
-            {
-                // 0xC5 OpenLevels; a teleport must not use it until we have a
-                // no-reload origin packet. Drop for now (same as unknown SMSG).
-                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                         "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (NEW_WORLD would OpenLevel)",
-                         uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
-                return;
-            }
+            if (op == SMSG_CHAR_CREATE)
+                sendOp = 0x232;
+            else if (op == SMSG_CHAR_DELETE)
+                sendOp = 0x233;
+            else if (op == SMSG_CHAR_RENAME)
+                sendOp = 0x3C3;
+            else if (op == SMSG_CHARACTER_LOGIN_FAILED)
+                sendOp = 0x216;
+            // 0x1EE AUTH_RESPONSE and 0x478 CHAR_ENUM already use live opcodes.
+            sendPacket.SetOpcode(sendOp);
         }
 
         if (sendOp != op)
@@ -349,9 +340,8 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
 
         if ((sendOp != 0x1FC && (!GetPlayer() || sendPacket.size() <= 64)) ||
             op == SMSG_AUTH_RESPONSE || op == SMSG_LOGIN_VERIFY_WORLD ||
-            op == SMSG_CHAR_ENUM || op == SMSG_TRIGGER_CINEMATIC ||
-            op == SMSG_LOGIN_SETTIMESPEED || op == 0x478 ||
-            sendOp == 0x17D || sendOp == 0xFA || sendOp == 0x2D7)
+            op == SMSG_CHAR_ENUM || op == SMSG_CHAR_CREATE || op == SMSG_CHAR_DELETE ||
+            sendOp == 0x478 || sendOp == 0x527 || sendOp == 0x232 || sendOp == 0x233)
         {
             char const* name = LookupOpcodeName(op);
             size_t const n = std::min<size_t>(sendPacket.size(), 256);
@@ -377,22 +367,6 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
             m_sniffFile->WritePacket(sendPacket, false, time(nullptr));
 
         m_socket->SendPacket(sendPacket);
-
-        // Char-select leaves Emberveil in 0xFA id=2 (UI). Self-pawn spawn
-        // (14486CE30 / SpawnActor) runs after 0x1FC; it needs world mode.
-        // 0xFA id=3 = stop. VERIFY is sent before AddToMap/0x1FC.
-        if (sendOp == 0x17D && !m_azrtCinematicStopSent)
-        {
-            m_azrtCinematicStopSent = true;
-            WorldPacket stopUi(0xFA, 4);
-            stopUi << uint32(3);
-            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                     "WorldSession: AZRT SMSG wire=0xFA cinematic-stop=3 after VERIFY map=%u",
-                     sendPacket.size() >= 4 ? sendPacket.read<uint32>(0) : 0u);
-            if (m_sniffFile)
-                m_sniffFile->WritePacket(stopUi, false, time(nullptr));
-            m_socket->SendPacket(stopUi);
-        }
         return;
     }
 
