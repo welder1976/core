@@ -422,6 +422,9 @@ class WorldSession
         void SendAccountDataTimes();
         // Emberveil: after CMSG 0x103 continue login (official TXT order).
         void AzrtContinueEnterWorld();
+        // Official: 0x200/0x172 after CMSG 0x11, not in the same burst as 0x1FC.
+        void AzrtFlushWorldAfterMover();
+        bool AzrtShouldDeferWorldStates() const { return m_azrtDeferWorldStates; }
         // Official 0x4FB → SMSG 0x3CC (guid + u32), not creature-query/0x509.
         void AzrtSendQueryName(ObjectGuid guid);
         void LoadGlobalAccountData();
@@ -885,6 +888,7 @@ class WorldSession
         bool m_azrtAwaitingEnterAck = false;
         bool m_azrtDeferredAlreadyOnline = false;
         bool m_azrtStub2A7AfterBind = false;
+        bool m_azrtDeferWorldStates = false;
         uint32 m_gameBuild;
         bool m_verifiedEmail;
         std::shared_ptr<PlayerBotEntry> m_bot;

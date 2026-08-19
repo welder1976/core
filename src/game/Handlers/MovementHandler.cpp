@@ -850,6 +850,9 @@ void WorldSession::HandleMoveSplineDoneOpcode(WorldPackets::Movement::MoveSpline
 
 void WorldSession::HandleSetActiveMoverOpcode(WorldPackets::Misc::SetActiveMover const& packet)
 {
+    if (GetPlatform() == CLIENT_PLATFORM_X64 && m_azrtDeferWorldStates)
+        AzrtFlushWorldAfterMover();
+
     if (!packet.guid.IsEmpty())
     {
         Unit* pMover = _player->GetMover();

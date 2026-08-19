@@ -8229,6 +8229,10 @@ static WorldStatePair def_world_states[] =
 
 void Player::SendInitWorldStates(uint32 zoneid) const
 {
+    // Emberveil: official 0x200 is after CMSG 0x11, not in the create-0x1FC burst.
+    if (GetSession() && GetSession()->AzrtShouldDeferWorldStates())
+        return;
+
     uint32 mapId = GetMapId();
 
     sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "Sending SMSG_INIT_WORLD_STATES to Map:%u, Zone: %u", mapId, zoneid);

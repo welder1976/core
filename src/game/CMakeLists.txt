@@ -477,6 +477,7 @@ set (game_SRCS
     Server/Packets/Warden.h
     Server/WorldPacket.h
     Server/WorldSession.h
+    Server/AzrtOpcodeMap.h
     Server/WorldSocket.h
     Server/WorldSocketMgr.h
     Spells/Spell.h

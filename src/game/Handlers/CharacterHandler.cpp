@@ -25,6 +25,7 @@
 #include "SharedDefines.h"
 #include "ClientDefines.h"
 #include "WorldSession.h"
+#include "AzrtOpcodeMap.h"
 #include "Opcodes.h"
 #include "Log.h"
 #include "World.h"
@@ -193,7 +194,7 @@ void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
     // (0x271 is scene-load; UOA default 0x3B matches mangos wire, not this client's table.)
     if (azrt)
     {
-        data.SetOpcode(static_cast<uint16>(0x478));
+        data.SetOpcode(AzrtOpcode::CHAR_ENUM);
         MarkAzrtCharEnumFullSent();
 
         // Emberveil lich=0: after the vanilla enum body the client requires 32 more
@@ -589,8 +590,9 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
         m_azrtDeferredAlreadyOnline = alreadyOnline;
         delete holder;
         sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                 "WorldSession: AZRT waiting CMSG 0x103 before enter-world guid=%u",
-                 pCurrChar->GetGUIDLow());
+                 "WorldSession: AZRT waiting CMSG 0x103 before enter-world guid=%u map=%u xyz=%.2f,%.2f,%.2f",
+                 pCurrChar->GetGUIDLow(), pCurrChar->GetMapId(),
+                 position.x, position.y, position.z);
         return;
     }
 

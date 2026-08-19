@@ -43,6 +43,7 @@
 #include "Utilities/Random.h"
 #include "ObjectMgr.h"
 #include "ObjectGuid.h"
+#include "Player.h"
 
 #include "IO/Networking/DNS.h"
 #include "IO/Timer/AsyncSystemTimer.h"
@@ -95,11 +96,42 @@ bool AzrtCanPassthroughClassicCmsg(uint16 opcode, size_t size)
         case CMSG_PING:
         case CMSG_CANCEL_CAST:
         case CMSG_CAST_SPELL:
+        case CMSG_AUCTION_SELL_ITEM: // Emberveil 0x256 is interact, not auction
+        case CMSG_AUCTION_LIST_BIDDER_ITEMS: // Emberveil 0x264 is quest query
             return false;
         default:
             break;
     }
     return size == 0 || size == 1 || size == 4 || size == 8;
+}
+
+// Right-click / use: creature -> gossip, GO -> use. Not inspect/auction.
+bool AzrtRemapGuidInteract(WorldPacket& packet, uint16 origOp)
+{
+    if (packet.size() != 8)
+        return false;
+    ObjectGuid guid;
+    packet.rpos(0);
+    packet >> guid;
+    uint16 mapped = 0;
+    if (guid.IsCreatureOrPet())
+        mapped = CMSG_GOSSIP_HELLO;
+    else if (guid.IsGameObject() || guid.IsMOTransport() || guid.IsTransport())
+        mapped = CMSG_GAMEOBJ_USE;
+    else
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT 0x%X guid-interact drop %s",
+                 uint32(origOp), guid.GetString().c_str());
+        return false;
+    }
+    packet.Initialize(mapped, 8);
+    packet << guid;
+    packet.rpos(0);
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+             "WorldSocket: AZRT 0x%X -> %s %s",
+             uint32(origOp), LookupOpcodeName(mapped), guid.GetString().c_str());
+    return true;
 }
 
 // Emberveil in-world CMSG remaps. Returns false to drop the packet.
@@ -108,6 +140,23 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
 {
     uint16 const opcode = packet.GetOpcode();
     size_t const size = packet.size();
+
+    // Official after SET_ACTIVE_MOVER / 0x200: empty notify CMSG (no dedicated SMSG).
+    // Next server packets are VALUES 0x1FC + 0x172 — not CHAR_ENUM / CHAR_CREATE.
+    if (size == 0 && (opcode == 0x42B || opcode == 0x416 || opcode == 0x4C2 ||
+                      opcode == 0x92 || opcode == 0x500))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT post-enter CMSG 0x%X size=0 (consumed)",
+                 uint32(opcode));
+        return false;
+    }
+    if (opcode == 0x2 && size == 8)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT post-enter CMSG 0x2 size=8 (consumed)");
+        return false;
+    }
 
     // Official TXT: 0x4FB ↔ SMSG 0x3CC (guid + u32). Never answer with 0x509.
     if (opcode == 0x4FB && size == 8)
@@ -162,6 +211,81 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
         return true;
     }
 
+    // 0x47E @ 0x14496ABB0: stores/clears current target at +0x8f8, then
+    // GAMEHIGHLIGHT*UNIT. Same 8-byte guid writer as 0x159. Must run before
+    // the generic >=NUM_MSG_TYPES guid-click remap (would become gossip).
+    if (opcode == 0x47E && size == 8)
+    {
+        packet.SetOpcode(CMSG_SET_SELECTION);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT 0x47E -> CMSG_SET_SELECTION");
+        return true;
+    }
+
+    // 0x256 @ 0x1449693E0: right-click/use when object type > 1
+    // (14485BBB0 skips player/item/dynobj). Classic 0x256 is CMSG_AUCTION_SELL_ITEM.
+    if (opcode == 0x256 && size == 8)
+        return AzrtRemapGuidInteract(packet, opcode);
+
+    // 0x4C4 @ 0x144967460: u32 then guid. GetGossipText cache miss (144862A30)
+    // shares this query helper. Classic CMSG_NPC_TEXT_QUERY layout.
+    if (opcode == 0x4C4 && size == 12)
+    {
+        packet.SetOpcode(CMSG_NPC_TEXT_QUERY);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT 0x4C4 -> CMSG_NPC_TEXT_QUERY");
+        return true;
+    }
+
+    // 0x287 @ 0x144969460: guid then u32. Lua SelectGossipAvailableQuest /
+    // SelectAvailableQuest (Usage: strings @ 14717EC80 / 1471824A8).
+    // 0x264 is the active-quest twin (SelectGossipActiveQuest).
+    if ((opcode == 0x287 || opcode == 0x264) && size == 12)
+    {
+        packet.SetOpcode(CMSG_QUESTGIVER_QUERY_QUEST);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT 0x%X -> CMSG_QUESTGIVER_QUERY_QUEST",
+                 uint32(opcode));
+        return true;
+    }
+
+    // 0x74 @ 0x144964550: SelectGossipOption — guid + u32 + optional code.
+    if (opcode == 0x74 && size >= 12)
+    {
+        packet.SetOpcode(CMSG_GOSSIP_SELECT_OPTION);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT 0x74 -> CMSG_GOSSIP_SELECT_OPTION size=%u",
+                 uint32(size));
+        return true;
+    }
+
+    // Movement family: shared sender 0x1449673E0, size always 0x50,
+    // serialize 0x1446651D0 (u32s + u64 at +0x20). Official 0x3CD etc.
+    // Do not queue as classic MSG_MOVE_* (packed guid layout).
+    if (size == 80)
+    {
+        uint32 f0 = 0, f1 = 0, f2 = 0;
+        float x = 0, y = 0, z = 0, o = 0;
+        uint64 tguid = 0;
+        memcpy(&f0, packet.contents() + 0x00, 4);
+        memcpy(&f1, packet.contents() + 0x04, 4);
+        memcpy(&f2, packet.contents() + 0x08, 4);
+        memcpy(&x, packet.contents() + 0x0C, 4);
+        memcpy(&y, packet.contents() + 0x10, 4);
+        memcpy(&z, packet.contents() + 0x14, 4);
+        memcpy(&o, packet.contents() + 0x18, 4);
+        memcpy(&tguid, packet.contents() + 0x20, 8);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT MOVE80 opcode=0x%X u32=%u,%u,%u xyz=(%f,%f,%f) o=%f tguid=%s",
+                 uint32(opcode), f0, f1, f2, x, y, z, o,
+                 ObjectGuid(tguid).GetString().c_str());
+        return false;
+    }
+
     // u32 payload. HandleZoneUpdateOpcode ignores the value and uses server position.
     if (opcode == 0x1AB && size == 4)
     {
@@ -170,6 +294,34 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
         sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
                  "WorldSocket: AZRT 0x1AB -> CMSG_ZONEUPDATE");
         return true;
+    }
+
+    // Official char-load: two C-strings (map/cinematic names). Not classic opcode 6.
+    if (opcode == 0x6)
+    {
+        std::string a;
+        std::string b;
+        try
+        {
+            packet >> a;
+            if (packet.rpos() < packet.size())
+                packet >> b;
+        }
+        catch (...) {}
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT CMSG 0x006 size=%u a='%s' b='%s'",
+                 uint32(size), a.c_str(), b.c_str());
+        return false;
+    }
+
+    // Official char-load: u32 immediately before 0x006. Consume, don't parse as classic.
+    if (opcode == 0x2F0 && size == 4)
+    {
+        uint32 value = 0;
+        packet >> value;
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSocket: AZRT CMSG 0x2F0 u32=%u", value);
+        return false;
     }
 
     // Classic number, extra bytes after the guid — strip to the 1.12 body.
@@ -458,7 +610,12 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                     //   0x221 -> CMSG_CHAR_DELETE
                     //   0x4EE -> CMSG_PLAYER_LOGIN — u64 guid + CString locale
                     //   0x011 -> CMSG_SET_ACTIVE_MOVER (8B guid)
-                    //   0x159 -> CMSG_SET_SELECTION (8B guid)
+                    //   0x159 / 0x47E -> CMSG_SET_SELECTION (8B guid)
+                    //   0x256 -> CMSG_GOSSIP_HELLO / CMSG_GAMEOBJ_USE
+                    //   0x4C4 -> CMSG_NPC_TEXT_QUERY (u32 + guid)
+                    //   0x287 / 0x264 -> CMSG_QUESTGIVER_QUERY_QUEST (guid + u32)
+                    //   0x74 -> CMSG_GOSSIP_SELECT_OPTION
+                    //   size=80 -> movement family (drop; log xyz)
                     //   0x1AB -> CMSG_ZONEUPDATE (u32)
                     //   0x4FB / 0x5D / 0x143 / 0xDE -> name/creature/GO/item query
                     // Unmapped in-world CMSG are dropped (numbers collide with classic SMSG).
@@ -466,6 +623,15 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                     {
                         if (opcode == 0x60 && packet->size() == 0)
                         {
+                            // Official also emits empty 0x60 after enter-world (HUD init).
+                            // Answering with 0x478 CHAR_ENUM while in-world unloads the map.
+                            Player* plr = m_Session->GetPlayer();
+                            if (plr && plr->IsInWorld())
+                            {
+                                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                         "WorldSocket: AZRT 0x60 in-world (not CHAR_ENUM)");
+                                return HandlerResult::Okay;
+                            }
                             sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
                                      "WorldSocket: AZRT 0x60 -> CMSG_CHAR_ENUM");
                             m_Session->HandleCharEnumOpcode(NullClientPacket(CMSG_CHAR_ENUM));
@@ -497,10 +663,30 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
 
                         if (opcode == 0x299)
                         {
-                            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                                     "WorldSocket: AZRT 0x299 -> CMSG_CHAR_CREATE size=%u",
-                                     uint32(packet->size()));
-                            packet->SetOpcode(CMSG_CHAR_CREATE);
+                            // Emberveil CMSG 0x299 — not classic CMSG_CHAR_CREATE (54).
+                            // Body: UTF-8 CString name + 9×u8 appearance. Do not queue
+                            // the wire opcode through the 1.12 reader.
+                            try
+                            {
+                                auto create = std::make_unique<WorldPackets::Character::CharCreate>();
+                                *packet >> create->name;
+                                *packet >> create->race >> create->class_ >> create->gender
+                                        >> create->skin >> create->face >> create->hairStyle
+                                        >> create->hairColor >> create->facialHair >> create->outfitId;
+                                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                         "WorldSocket: AZRT 0x299 CHAR_CREATE name=%s race=%u class=%u gender=%u size=%u unread=%u",
+                                         create->name.c_str(), uint32(create->race), uint32(create->class_),
+                                         uint32(create->gender), uint32(packet->size()),
+                                         uint32(packet->size() - packet->rpos()));
+                                m_Session->QueuePacket(std::move(create));
+                            }
+                            catch (ByteBufferException&)
+                            {
+                                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                                         "WorldSocket: AZRT 0x299 CHAR_CREATE parse fail size=%u",
+                                         uint32(packet->size()));
+                            }
+                            return HandlerResult::Okay;
                         }
                         else if (opcode == 0x221)
                         {

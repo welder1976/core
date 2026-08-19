@@ -44,6 +44,8 @@
 #include "PlayerBroadcaster.h"
 #include "Crypto/Hash/MD5.h"
 #include "UpdateData.h"
+#include "UpdateFields.h"
+#include "AzrtOpcodeMap.h"
 #include "AccountMgr.h"
 #include "DBCStores.h"
 #include "ObjectAccessor.h"
@@ -208,59 +210,34 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
 
 #endif // _DEBUG
 
-    // AZRT/x64: drop unsafe classic bodies, remap S->C opcodes the client actually hooks.
+    // AZRT/x64: UOA OpcodeMap + Emberveil live table. Drop classic move/spell
+    // bodies (they corrupt the UE actor). Do NOT invent UOA 0x527/0x102.
     if (GetPlatform() == CLIENT_PLATFORM_X64)
     {
         uint16 op = packet->GetOpcode();
-        switch (op)
-        {
-            case SMSG_MONSTER_MOVE:
-            case SMSG_MONSTER_MOVE_TRANSPORT:
-            case SMSG_SPELL_START:
-            case SMSG_SPELL_GO:
-            case SMSG_SPLINE_MOVE_ROOT:
-            case SMSG_SPLINE_MOVE_UNROOT:
-            case SMSG_SPLINE_MOVE_FEATHER_FALL:
-            case SMSG_SPLINE_MOVE_NORMAL_FALL:
-            case SMSG_SPLINE_MOVE_SET_HOVER:
-            case SMSG_SPLINE_MOVE_UNSET_HOVER:
-            case SMSG_SPLINE_MOVE_WATER_WALK:
-            case SMSG_SPLINE_MOVE_LAND_WALK:
-            case SMSG_SPLINE_MOVE_START_SWIM:
-            case SMSG_SPLINE_MOVE_STOP_SWIM:
-            case SMSG_SPLINE_MOVE_SET_RUN_MODE:
-            case SMSG_SPLINE_MOVE_SET_WALK_MODE:
-                sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                         "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (classic body unsafe)",
-                         uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
-                return;
-            default:
-                break;
-        }
-
-        // Official Emberveil enter-world (Frida TXT):
-        //   CMSG 0x4EE → SMSG 0x2AC×6 → SMSG 0xC5 (VERIFY) → CMSG 0x103
-        //   → 0x28E → 0x313 → 0x13B → 0x210 → 0x477 → 0x2A7
-        //   → 0x2EB → 0x4FA → 0x2EE → 0x2D7 → 0x4FA → SMSG 0x1FC (create)
-        // Auth/charlist: 0x1EC/0x1EE/0x478/0x232/0x233/0x3C3/0x216.
-        // Do NOT invent 0x236/0x527/0xFA slots.
-        uint16 sendOp = op;
-
-        if (op == SMSG_DESTROY_OBJECT || op == SMSG_NEW_WORLD)
+        if (AzrtOpcode::DropUnsafeClassicBody(op))
         {
             sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
-                     "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (no live Emberveil handler)",
+                     "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X) name=%s size=%u (classic body unsafe)",
                      uint32(op), uint32(op), LookupOpcodeName(op), uint32(packet->size()));
             return;
         }
 
+        // Official Emberveil enter-world (Frida, 2026-08-17):
+        //   CMSG 0x4EE → SMSG 0x2AC×9 → SMSG 0xC5 (VERIFY 20) → CMSG 0x103
+        //   → 0x28E (128 zero) → 0x313/0x13B (u8 0) → 0x210 stub (4 zero)
+        //   → 0x477 bind → 0x2A7 stub (32 zero) → 0x2EB → 0x4FA → 0x2EE
+        //   → 0x2D7 → 0x4FA → SMSG 0x1FC (u32 uncomp + zlib 78 01)
+        // Auth/charlist: 0x1EC/0x1EE/0x478/0x232/0x233/0x3C3/0x216.
+        uint16 sendOp = AzrtOpcode::RemapServerOpcode(op);
+
         WorldPacket sendPacket;
         if (op == SMSG_COMPRESSED_UPDATE_OBJECT || op == SMSG_UPDATE_OBJECT)
         {
-            // Official 0x1FC handler (0x14494CBE0): u32 uncompressedSize + UE
+            // Live 0x1FC @ 0x14494DC00: u32 uncompressedSize + UE
             // FCompression flags 0x101 (= Zlib). Same wire shape as classic
             // SMSG_COMPRESSED_UPDATE_OBJECT — do NOT send raw update blocks.
-            sendOp = 0x1FC;
+            sendOp = AzrtOpcode::COMPRESSED_UPDATE;
             if (op == SMSG_COMPRESSED_UPDATE_OBJECT)
             {
                 if (packet->size() < sizeof(uint32))
@@ -275,7 +252,8 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                     return;
                 uLongf destLen = compressBound(realSize);
                 std::vector<uint8> dest(destLen);
-                int const zerr = compress(dest.data(), &destLen, packet->contents(), realSize);
+                // Official 0x1FC zlib header is 78 01 (Z_BEST_SPEED), not 78 9c.
+                int const zerr = compress2(dest.data(), &destLen, packet->contents(), realSize, Z_BEST_SPEED);
                 if (zerr != Z_OK || destLen == 0)
                 {
                     sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
@@ -288,77 +266,14 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                 sendPacket.append(dest.data(), destLen);
             }
         }
-        else if (op == SMSG_LOGIN_VERIFY_WORLD)
-        {
-            // Official: VERIFY on 0xC5 → 0x144950280 (map + xyz + orient).
-            sendOp = 0xC5;
-            sendPacket = WorldPacket(*packet);
-            sendPacket.SetOpcode(sendOp);
-        }
-        else if (op == SMSG_LOGIN_SETTIMESPEED)
-        {
-            // Official: 0x2D7 → packed GameTime u32 + float speed (classic body).
-            sendOp = 0x2D7;
-            sendPacket = WorldPacket(*packet);
-            sendPacket.SetOpcode(sendOp);
-        }
-        else if (op == SMSG_ACCOUNT_DATA_MD5)
-        {
-            // Handled in SendAccountDataTimes as 0x2AC×N; should not reach here.
-            return;
-        }
         else
         {
             sendPacket = WorldPacket(*packet);
-            if (op == SMSG_CHAR_CREATE)
-                sendOp = 0x232;
-            else if (op == SMSG_CHAR_DELETE)
-                sendOp = 0x233;
-            else if (op == SMSG_CHAR_RENAME)
-                sendOp = 0x3C3;
-            else if (op == SMSG_CHARACTER_LOGIN_FAILED)
-                sendOp = 0x216;
-            // Body-matched to official live handlers (Frida + .text):
-            else if (op == SMSG_ACTION_BUTTONS)
-                sendOp = 0x4FA; // 120×u32 @ 0x14494B840
-            else if (op == SMSG_BINDPOINTUPDATE)
-                sendOp = 0x477; // xyz + map + area @ 0x14494BED0
-            else if (op == SMSG_INITIAL_SPELLS)
-                sendOp = 0x2EB; // u8 + u16 count + (u16,u16)*N @ 0x14493D910
-            else if (op == SMSG_INITIALIZE_FACTIONS)
-                sendOp = 0x2EE; // u32 count + (u8,u32)*N @ 0x14494DFF0
-            else if (op == SMSG_GAMEOBJECT_QUERY_RESPONSE)
-                sendOp = 0x04F; // body rebuilt for Emberveil in QueryHandler
-            else if (op == SMSG_CREATURE_QUERY_RESPONSE)
-                sendOp = 0x509; // body rebuilt for Emberveil in QueryHandler
-            else if (op == SMSG_ITEM_QUERY_SINGLE_RESPONSE)
-                sendOp = 0x294; // body rebuilt for Emberveil in ItemHandler
             sendPacket.SetOpcode(sendOp);
         }
 
-        // Live SMSG from official Frida capture + auth/charlist.
-        auto azrtLiveSmsg = [](uint16 wire) -> bool
-        {
-            switch (wire)
-            {
-                case 0x02F: case 0x04F: case 0x076: case 0x07A: case 0x0BC: case 0x0C5:
-                case 0x0E0: case 0x0F0: case 0x108: case 0x117: case 0x12E: case 0x135:
-                case 0x137: case 0x13B: case 0x169: case 0x172: case 0x1A4: case 0x1B6:
-                case 0x1D2: case 0x1DD: case 0x1E4: case 0x1EC: case 0x1EE: case 0x1FA:
-                case 0x1FC: case 0x200: case 0x210: case 0x216: case 0x220: case 0x232:
-                case 0x233: case 0x288: case 0x28A: case 0x28E: case 0x294: case 0x2A2:
-                case 0x2A7: case 0x2AC: case 0x2C3: case 0x2CA: case 0x2D7: case 0x2DA:
-                case 0x2E8: case 0x2EB: case 0x2EE: case 0x313: case 0x321: case 0x325:
-                case 0x334: case 0x336: case 0x352: case 0x356: case 0x385: case 0x3C3:
-                case 0x3CC: case 0x3CD: case 0x404: case 0x413: case 0x41B: case 0x439:
-                case 0x473: case 0x477: case 0x478: case 0x496: case 0x4A9: case 0x4ED:
-                case 0x4F1: case 0x4FA: case 0x509:
-                    return true;
-                default:
-                    return false;
-            }
-        };
-        if (!azrtLiveSmsg(sendOp))
+        // Live SMSG: WorldVerifyProbe Register 0x495E430 dump + auth/char extras.
+        if (!AzrtOpcode::IsLiveSmsg(sendOp))
         {
             sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
                      "WorldSession: AZRT DROP_SMSG opcode=%u (0x%X/%s) wire=%u (0x%X) size=%u (not in live table)",
@@ -387,7 +302,7 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
         }
 
         if ((sendOp != 0x1FA && sendOp != 0x1FC && (!GetPlayer() || sendPacket.size() <= 64)) ||
-            op == SMSG_AUTH_RESPONSE || op == SMSG_LOGIN_VERIFY_WORLD ||
+            op == SMSG_AUTH_RESPONSE || op == SMSG_LOGIN_VERIFY_WORLD || op == SMSG_NEW_WORLD ||
             op == SMSG_CHAR_ENUM || op == SMSG_CHAR_CREATE || op == SMSG_CHAR_DELETE ||
             op == SMSG_LOGIN_SETTIMESPEED ||
             sendOp == 0x478 || sendOp == 0xC5 || sendOp == 0x2D7 || sendOp == 0x2AC ||
@@ -422,12 +337,14 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
         if (sendOp == 0x477 && m_azrtStub2A7AfterBind)
         {
             m_azrtStub2A7AfterBind = false;
-            WorldPacket stub(0x2A7, 0);
+            WorldPacket stub(0x2A7, 32);
+            uint8 zeros[32] = {};
+            stub.append(zeros, sizeof(zeros));
             if (m_sniffFile)
                 m_sniffFile->WritePacket(stub, false, time(nullptr));
             m_socket->SendPacket(stub);
             sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                     "WorldSession: AZRT SMSG wire=0x2A7 size=0 (after bind, official TXT)");
+                     "WorldSession: AZRT SMSG wire=0x2A7 size=32 (after bind, official capture)");
         }
         return;
     }
@@ -1079,6 +996,7 @@ void WorldSession::LogoutPlayer(bool Save)
         m_azrtAwaitingEnterAck = false;
         m_azrtDeferredAlreadyOnline = false;
         m_azrtStub2A7AfterBind = false;
+        m_azrtDeferWorldStates = false;
 
         // Send the 'logout complete' packet to the client
         SendPacket(std::make_unique<WorldPackets::Misc::LogoutComplete>());
@@ -1308,6 +1226,28 @@ void WorldSession::AzrtSendQueryName(ObjectGuid guid)
     SendPacket(&data);
 }
 
+void WorldSession::AzrtFlushWorldAfterMover()
+{
+    if (!m_azrtDeferWorldStates)
+        return;
+    m_azrtDeferWorldStates = false;
+    Player* player = GetPlayer();
+    if (!player)
+        return;
+    // Official enter after CMSG 0x11: 0x200 → VALUES 0x1FC (~182, maskCount 0x29) → 0x172.
+    player->SendInitWorldStates(player->GetCachedZoneId());
+    {
+        UpdateData upd;
+        player->BuildValuesUpdateBlockForPlayerWithFlags(upd, player, UF_FLAG_PUBLIC, false);
+        if (upd.HasData())
+            upd.Send(this, false);
+    }
+    SendQueryTimeResponse();
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+             "WorldSession: AZRT 0x200/0x1FC-values/0x172 after SET_ACTIVE_MOVER guid=%u zone=%u",
+             player->GetGUIDLow(), player->GetCachedZoneId());
+}
+
 void WorldSession::AzrtContinueEnterWorld()
 {
     if (GetPlatform() != CLIENT_PLATFORM_X64 || !m_azrtAwaitingEnterAck)
@@ -1323,14 +1263,12 @@ void WorldSession::AzrtContinueEnterWorld()
     bool const alreadyOnline = m_azrtDeferredAlreadyOnline;
     m_azrtDeferredAlreadyOnline = false;
 
-    // Official TXT after CMSG 0x103:
-    //   0x28E → 0x313 → 0x13B → 0x210 → 0x477 → 0x2A7 → spells/buttons/…
-    // 0x28E: datetime handler; u32=0 avoids the corrupt FILETIME offset we hit before.
+    // Official capture after CMSG 0x103:
+    //   0x28E (128 zero) → 0x313 u8=0 → 0x13B u8=0 → 0x210 stub (4 zero)
     {
-        WorldPacket data(0x28E, 9);
-        data << uint32(0);
-        data << uint8(0);
-        data << uint32(0);
+        WorldPacket data(0x28E, 128);
+        uint8 zeros[128] = {};
+        data.append(zeros, sizeof(zeros));
         SendPacket(&data);
     }
     {
@@ -1344,65 +1282,25 @@ void WorldSession::AzrtContinueEnterWorld()
         SendPacket(&data);
     }
     {
-        WorldPacket data(0x210, 0);
+        WorldPacket data(0x210, 4);
+        data << uint32(0);
         SendPacket(&data);
     }
 
     sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-             "WorldSession: AZRT continue-enter after 0x103 (early 0x28E/0x313/0x13B/0x210) account=%u guid=%u",
+             "WorldSession: AZRT continue-enter after 0x103 (0x28E/0x313/0x13B/0x210 official bodies) account=%u guid=%u",
              GetAccountId(), pCurrChar->GetGUIDLow());
 
-    pCurrChar->GetSocial()->SendFriendList();
-    pCurrChar->GetSocial()->SendIgnoreList();
-
-    {
-        uint32 linecount = 0;
-        std::string str_motd = sWorld.GetMotd();
-        std::string::size_type pos, nextpos;
-        pos = 0;
-        while ((nextpos = str_motd.find('@', pos)) != std::string::npos)
-        {
-            if (nextpos != pos)
-            {
-                pCurrChar->PSendSysMessage(str_motd.substr(pos, nextpos - pos).c_str());
-                ++linecount;
-            }
-            pos = nextpos + 1;
-        }
-        if (pos < str_motd.length())
-        {
-            pCurrChar->PSendSysMessage(str_motd.substr(pos).c_str());
-            ++linecount;
-        }
-    }
-
-    if (Guild* guild = sGuildMgr.GetGuildById(pCurrChar->GetGuildId()))
-    {
-        auto guildEvent = std::make_unique<WorldPackets::Guild::GuildEvent>();
-        guildEvent->event = GE_MOTD;
-        guildEvent->params.push_back(guild->GetMOTD());
-        SendPacket(std::move(guildEvent));
-        guild->BroadcastEvent(GE_SIGNED_ON, pCurrChar->GetObjectGuid(), pCurrChar->GetName());
-    }
-
-    if (char const* warning = sAccountMgr.GetWarningText(GetAccountId()))
-    {
-        pCurrChar->PSendSysMessage(LANG_ACCOUNT_WARNED, warning);
-        SendNotification("WARNING: %s", warning);
-    }
-
-    if (!pCurrChar->IsAlive())
-        pCurrChar->SendCorpseReclaimDelay(true);
-
-    // Official TXT: 0x477 (bind) then empty 0x2A7 then spells — inject stub after bind remap.
+    // Official capture: 0x477 then 0x2A7 then spells/4FA/factions/timespeed/4FA then 0x1FC.
+    // 0x200/0x172 come after the client SET_ACTIVE_MOVER (0x11), not here.
     m_azrtStub2A7AfterBind = true;
+    m_azrtDeferWorldStates = true;
     pCurrChar->SendInitialPacketsBeforeAddToMap();
-
-    // Official TXT has no classic 0xFA cinematic; SendCinematicStart will DROP if unmapped.
-    if (pCurrChar->m_playedTime[PLAYED_TIME_TOTAL] == 0 && !sWorld.getConfig(CONFIG_BOOL_SKIP_CINEMATICS))
     {
-        if (ChrRacesEntry const* rEntry = sChrRacesStore.LookupEntry(pCurrChar->GetRace()))
-            pCurrChar->SendCinematicStart(rEntry->CinematicSequence);
+        WorldPacket data(SMSG_ACTION_BUTTONS, MAX_ACTION_BUTTONS * 4);
+        for (int button = 0; button < MAX_ACTION_BUTTONS; ++button)
+            data << uint32(0);
+        SendPacket(&data);
     }
 
     if (!alreadyOnline && !pCurrChar->GetMap()->Add(pCurrChar))
@@ -1423,8 +1321,6 @@ void WorldSession::AzrtContinueEnterWorld()
         sObjectAccessor.AddObject(pCurrChar);
 
     pCurrChar->SendInitialPacketsAfterAddToMap();
-    if (alreadyOnline)
-        pCurrChar->SendInitWorldStates(pCurrChar->GetCachedZoneId());
 
     static SqlStatementID updChars;
     static SqlStatementID updAccount;
@@ -1509,14 +1405,26 @@ void WorldSession::SendAccountDataTimes()
 {
     using namespace Crypto::Hash;
 
-    // Official Emberveil: six SMSG 0x2AC (u8 type, u32 value) before VERIFY.
+    // Official Emberveil (Frida, two enters, identical): nine SMSG 0x2AC
+    // of (u8 type, u32 flags) before VERIFY. Not timestamps.
     if (GetPlatform() == CLIENT_PLATFORM_X64)
     {
-        for (uint8 index = 0; index < 6; ++index)
+        static uint8 const kOfficial2AC[][5] =
+        {
+            { 0x02, 0x80, 0x00, 0x00, 0x00 },
+            { 0x02, 0x81, 0x00, 0x00, 0x00 },
+            { 0x02, 0x91, 0x00, 0x00, 0x00 },
+            { 0x02, 0x91, 0x40, 0x00, 0x00 },
+            { 0x04, 0x01, 0x00, 0x00, 0x00 },
+            { 0x04, 0x09, 0x00, 0x00, 0x00 },
+            { 0x04, 0x0D, 0x00, 0x00, 0x00 },
+            { 0x04, 0x0F, 0x00, 0x00, 0x00 },
+            { 0x04, 0x4F, 0x00, 0x00, 0x00 },
+        };
+        for (auto const& body : kOfficial2AC)
         {
             WorldPacket data(0x2AC, 5);
-            data << uint8(index);
-            data << uint32(m_accountData[index].timestamp);
+            data.append(body, 5);
             SendPacket(&data);
         }
         return;
