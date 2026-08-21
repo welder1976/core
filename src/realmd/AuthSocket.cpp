@@ -52,6 +52,7 @@
 #endif
 
 #include <ctime>
+#include <vector>
 
 //#include "Util.h" -- for commented utf8ToUpperOnlyLatin
 
@@ -130,6 +131,8 @@ void AuthSocket::DoRecvIncomingData()
             { CMD_AUTH_AZRT_LOGON_PROOF,        STATUS_LOGON_PROOF, &AuthSocket::_HandleLogonProof },
             { CMD_REALM_LIST,                   STATUS_AUTHED,      &AuthSocket::_HandleRealmList },
             { CMD_AUTH_AZRT_REALM_LIST,         STATUS_AUTHED,      &AuthSocket::_HandleRealmList },
+            { CMD_AUTH_AZRT_KEY_ACK,            STATUS_AUTHED,      &AuthSocket::_HandleAzrtIgnore },
+            { CMD_AUTH_AZRT_KEY_INSTALL_ACK,    STATUS_AUTHED,      &AuthSocket::_HandleAzrtIgnore },
             { CMD_XFER_ACCEPT,                  STATUS_PATCH,       &AuthSocket::_HandleXferAccept },
             { CMD_XFER_RESUME,                  STATUS_PATCH,       &AuthSocket::_HandleXferResume },
             { CMD_XFER_CANCEL,                  STATUS_PATCH,       &AuthSocket::_HandleXferCancel }
@@ -147,7 +150,8 @@ void AuthSocket::DoRecvIncomingData()
             // Remember AZRT dialect so replies use matching opcodes
             if (*cmd == CMD_AUTH_AZRT_LOGON_CHALLENGE || *cmd == CMD_AUTH_AZRT_CHALLENGE_RESP ||
                 *cmd == CMD_AUTH_AZRT_LOGON_PROOF || *cmd == CMD_AUTH_AZRT_PROOF_RESP ||
-                *cmd == CMD_AUTH_AZRT_REALM_LIST)
+                *cmd == CMD_AUTH_AZRT_REALM_LIST || *cmd == CMD_AUTH_AZRT_KEY_ACK ||
+                *cmd == CMD_AUTH_AZRT_KEY_INSTALL_ACK)
             {
                 self->m_azrtClient = true;
                 sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[%s] AZRT auth dialect enabled (cmd %u)", self->GetRemoteIpString().c_str(), *cmd);
@@ -172,6 +176,16 @@ void AuthSocket::DoRecvIncomingData()
         // Report unknown commands in the debug log
         if (i == tableLength)
         {
+            // Unreal-Open-Azeroth AuthProxy: unknown post-proof AZRT frames
+            // (A6/A9 siblings) are size-prefixed; drop the body and keep reading
+            // so a stray ack cannot stall the realm-list (B0).
+            if (self->m_azrtClient && uint8(*cmd) >= 0xA0 && uint8(*cmd) <= 0xBF &&
+                self->m_status == STATUS_AUTHED)
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[Auth] AZRT ignore cmd %u", uint32(*cmd));
+                self->_HandleAzrtIgnore();
+                return;
+            }
             sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[Auth] got unknown packet cmd %u", *cmd);
             return;
         }
@@ -1680,6 +1694,47 @@ void AuthSocket::LoadRealmlistAndWriteIntoBuffer(ByteBuffer &pkt)
 
         pkt << uint16(0x0010);                          // unused value (why 10?)
     }
+}
+
+// Unreal-Open-Azeroth AuthProxy.cpp: after A3 the client may emit A6 (key ack)
+// and A9 (key-install ack, 58 bytes). Same uint16 size prefix as B0. No reply.
+void AuthSocket::_HandleAzrtIgnore()
+{
+    auto sizeField = std::make_shared<uint16>(0);
+    m_socket.Read(reinterpret_cast<char*>(sizeField.get()), sizeof(uint16),
+        [self = shared_from_this(), sizeField](IO::NetworkError const& error, size_t)
+        {
+            if (error)
+            {
+                self->CloseSocket();
+                return;
+            }
+            uint16 bodySize = *sizeField;
+            EndianConvert(bodySize);
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[Auth] AZRT ignore body size=%u", uint32(bodySize));
+            if (bodySize == 0)
+            {
+                self->DoRecvIncomingData();
+                return;
+            }
+            if (bodySize > 1024)
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[Auth] AZRT ignore size too large: %u", uint32(bodySize));
+                self->CloseSocket();
+                return;
+            }
+            auto raw = std::make_shared<std::vector<uint8>>(bodySize);
+            self->m_socket.Read(reinterpret_cast<char*>(raw->data()), bodySize,
+                [self](IO::NetworkError const& error2, size_t)
+                {
+                    if (error2)
+                    {
+                        self->CloseSocket();
+                        return;
+                    }
+                    self->DoRecvIncomingData();
+                });
+        });
 }
 
 // Accept patch transfer

@@ -45,6 +45,7 @@
 #include "Crypto/Hash/MD5.h"
 #include "UpdateData.h"
 #include "UpdateFields.h"
+#include "UpdateMask.h"
 #include "AzrtOpcodeMap.h"
 #include "AccountMgr.h"
 #include "DBCStores.h"
@@ -211,7 +212,8 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
 #endif // _DEBUG
 
     // AZRT/x64: UOA OpcodeMap + Emberveil live table. Drop classic move/spell
-    // bodies (they corrupt the UE actor). Do NOT invent UOA 0x527/0x102.
+    // bodies (they corrupt the UE actor). Official sniff has 0x527 before
+    // CHAR_ENUM; do not invent UOA's 0x102 map-ready pawn.
     if (GetPlatform() == CLIENT_PLATFORM_X64)
     {
         uint16 op = packet->GetOpcode();
@@ -223,17 +225,19 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
             return;
         }
 
-        // Official Emberveil enter-world (Frida, 2026-08-17):
+        // Official Emberveil enter-world:
         //   CMSG 0x4EE → SMSG 0x2AC×9 → SMSG 0xC5 (VERIFY 20) → CMSG 0x103
         //   → 0x28E (128 zero) → 0x313/0x13B (u8 0) → 0x210 stub (4 zero)
         //   → 0x477 bind → 0x2A7 stub (32 zero) → 0x2EB → 0x4FA → 0x2EE
         //   → 0x2D7 → 0x4FA → SMSG 0x1FC (u32 uncomp + zlib 78 01)
+        //   then CMSG 0x4FB/0x11, then 0x200 / VALUES 0x1FC / 0x172 (no 0x102).
         // Auth/charlist: 0x1EC/0x1EE/0x478/0x232/0x233/0x3C3/0x216.
         uint16 sendOp = AzrtOpcode::RemapServerOpcode(op);
 
         WorldPacket sendPacket;
         if (op == SMSG_COMPRESSED_UPDATE_OBJECT || op == SMSG_UPDATE_OBJECT)
         {
+            // Official enter: first 0x1FC is self CREATE (items included).
             // Live 0x1FC @ 0x14494DC00: u32 uncompressedSize + UE
             // FCompression flags 0x101 (= Zlib). Same wire shape as classic
             // SMSG_COMPRESSED_UPDATE_OBJECT — do NOT send raw update blocks.
@@ -293,6 +297,51 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
                          uint32(op), uint32(op), LookupOpcodeName(op),
                          uint32(sendOp), uint32(sendOp), uint32(sendPacket.size()),
                          uncompSize, sendPacket[4], sendPacket[5]);
+                if (uncompSize && sendPacket.size() > 4)
+                {
+                    std::vector<uint8> raw(uncompSize);
+                    uLongf rawLen = uncompSize;
+                    int const zerr = uncompress(raw.data(), &rawLen, sendPacket.contents() + 4, uLong(sendPacket.size() - 4));
+                    if (zerr == Z_OK)
+                    {
+                        static uint32 azrt1fcDump = 0;
+                        if (azrt1fcDump < 8)
+                        {
+                            ++azrt1fcDump;
+                            char dumpPath[160];
+                            std::snprintf(dumpPath, sizeof(dumpPath),
+                                          "E:/vmangos-bin/logs/azrt-local-1fc-%02u.bin", azrt1fcDump);
+                            if (FILE* df = std::fopen(dumpPath, "wb"))
+                            {
+                                std::fwrite(sendPacket.contents(), 1, sendPacket.size(), df);
+                                std::fclose(df);
+                            }
+                        }
+                        uint32 blocks = 0;
+                        uint8 hasT = 0, firstUt = 0;
+                        if (rawLen >= 6)
+                        {
+                            memcpy(&blocks, raw.data(), 4);
+                            hasT = raw[4];
+                            firstUt = raw[5];
+                        }
+                        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                 "WorldSession: AZRT 0x1FC dump[%u] uncomp=%u blocks=%u hasT=%u firstUt=%u file=azrt-local-1fc-%02u.bin",
+                                 uint32(rawLen), uint32(rawLen), blocks, uint32(hasT), uint32(firstUt), azrt1fcDump);
+                        size_t const n = std::min<size_t>(rawLen, uncompSize <= 800 ? 96 : 24);
+                        std::string hex;
+                        hex.reserve(n * 3);
+                        for (size_t i = 0; i < n; ++i)
+                        {
+                            char b[4];
+                            std::snprintf(b, sizeof(b), "%02X ", raw[i]);
+                            hex += b;
+                        }
+                        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                                 "WorldSession: AZRT 0x1FC uncomp[%u]: %s",
+                                 uint32(rawLen), hex.c_str());
+                    }
+                }
             }
             else
             sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
@@ -306,7 +355,7 @@ void WorldSession::SendPacketImpl(WorldPacket const* packet)
             op == SMSG_CHAR_ENUM || op == SMSG_CHAR_CREATE || op == SMSG_CHAR_DELETE ||
             op == SMSG_LOGIN_SETTIMESPEED ||
             sendOp == 0x478 || sendOp == 0xC5 || sendOp == 0x2D7 || sendOp == 0x2AC ||
-            sendOp == 0x232 || sendOp == 0x233)
+            sendOp == 0x232 || sendOp == 0x233 || sendOp == 0x527)
         {
             char const* name = LookupOpcodeName(op);
             size_t const n = std::min<size_t>(sendPacket.size(), 256);
@@ -1030,7 +1079,21 @@ void WorldSession::LogoutPlayer(bool Save)
 void WorldSession::KickPlayer()
 {
     if (m_socket)
+    {
+        if (GetPlatform() == CLIENT_PLATFORM_X64)
+        {
+            // KickPlayer used to only FIN the TCP socket. Emberveil's fly-cam
+            // map is a local UE level and ignores that. 0x4C/0x4D are live.
+            auto logout = std::make_unique<WorldPackets::Misc::LogoutResponse>();
+            logout->reason = 0;
+            logout->instant = 1;
+            SendPacket(std::move(logout));
+            SendPacket(std::make_unique<WorldPackets::Misc::LogoutComplete>());
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                     "WorldSession: AZRT kick logout 0x4C/0x4D account=%u", GetAccountId());
+        }
         m_socket->CloseSocket();
+    }
     else if (m_bot)
         m_bot->requestRemoval = true;
 }
@@ -1212,6 +1275,21 @@ void WorldSession::SetAccountData(NewAccountData::AccountDataType type, const st
     m_accountData[type].data = data;
 }
 
+void WorldSession::AzrtSendWorldAccess()
+{
+    if (GetPlatform() != CLIENT_PLATFORM_X64)
+        return;
+    // Official enter dump: SMSG 0x527 size 5 = 01 00 00 00 00, immediately
+    // before CHAR_ENUM. UOA: 0xC5 alone validates the map; this grant is what
+    // drives local AzerothCharacter possess. NPCs do not need it.
+    WorldPacket data(AzrtOpcode::WORLD_ACCESS, 5);
+    data << uint8(1);
+    data << uint32(0);
+    SendPacket(&data);
+    sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+             "WorldSession: AZRT 0x527 WORLD_ACCESS account=%u", GetAccountId());
+}
+
 void WorldSession::AzrtSendQueryName(ObjectGuid guid)
 {
     // Official 0x3CC @ 0x14494A740: raw u64 guid + u32 (stored on the client object).
@@ -1234,18 +1312,16 @@ void WorldSession::AzrtFlushWorldAfterMover()
     Player* player = GetPlayer();
     if (!player)
         return;
-    // Official enter after CMSG 0x11: 0x200 → VALUES 0x1FC (~182, maskCount 0x29) → 0x172.
+    // Official enter: after CMSG 0x11, SMSG 0x200 then (optional VALUES 0x1FC)
+    // then 0x172. The tiny VALUES in the capture is another object's update,
+    // not a fabricated appearance dump. Do not send 0x102.
     player->SendInitWorldStates(player->GetCachedZoneId());
-    {
-        UpdateData upd;
-        player->BuildValuesUpdateBlockForPlayerWithFlags(upd, player, UF_FLAG_PUBLIC, false);
-        if (upd.HasData())
-            upd.Send(this, false);
-    }
     SendQueryTimeResponse();
     sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-             "WorldSession: AZRT 0x200/0x1FC-values/0x172 after SET_ACTIVE_MOVER guid=%u zone=%u",
-             player->GetGUIDLow(), player->GetCachedZoneId());
+             "WorldSession: AZRT 0x200/0x172 after CMSG 0x11 guid=%u display=%u race=%u gender=%u zone=%u",
+             player->GetGUIDLow(), player->GetDisplayId(),
+             uint32(player->GetRace()), uint32(player->GetGender()),
+             player->GetCachedZoneId());
 }
 
 void WorldSession::AzrtContinueEnterWorld()
@@ -1292,7 +1368,7 @@ void WorldSession::AzrtContinueEnterWorld()
              GetAccountId(), pCurrChar->GetGUIDLow());
 
     // Official capture: 0x477 then 0x2A7 then spells/4FA/factions/timespeed/4FA then 0x1FC.
-    // 0x200/0x172 come after the client SET_ACTIVE_MOVER (0x11), not here.
+    // 0x200/0x172 wait for CMSG 0x11 (player guid). No 0x102.
     m_azrtStub2A7AfterBind = true;
     m_azrtDeferWorldStates = true;
     pCurrChar->SendInitialPacketsBeforeAddToMap();
@@ -1321,6 +1397,9 @@ void WorldSession::AzrtContinueEnterWorld()
         sObjectAccessor.AddObject(pCurrChar);
 
     pCurrChar->SendInitialPacketsAfterAddToMap();
+    // Server-side mover so movement is not stuck if 0x11 is late. 0x200 still
+    // waits for the official CMSG 0x11 (player guid) in HandleSetActiveMover.
+    m_clientMoverGuid = pCurrChar->GetObjectGuid();
 
     static SqlStatementID updChars;
     static SqlStatementID updAccount;

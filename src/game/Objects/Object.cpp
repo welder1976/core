@@ -318,6 +318,11 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
     if (!target)
         return;
 
+    bool const azrt = target->GetSession() && target->GetSession()->GetPlatform() == CLIENT_PLATFORM_X64;
+    // Official Emberveil self 0x1FC: bags are TYPEID_ITEM (not CONTAINER), player is
+    // UPDATETYPE_CREATE_OBJECT (2) with updateFlags 0x71 and moveFlags 0.
+    bool const azrtBagAsItem = azrt && GetTypeId() == TYPEID_CONTAINER;
+
     uint8 updatetype   = UPDATETYPE_CREATE_OBJECT;
     uint8 updateFlags  = m_updateFlag;
 
@@ -328,14 +333,14 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
     if (IsUnit() && static_cast<Unit const*>(this)->HasUnitState(UNIT_STATE_MELEE_ATTACKING) && static_cast<Unit const*>(this)->GetVictim())
         updateFlags |= UPDATEFLAG_MELEE_ATTACKING;
 
-    if (m_isNewObject)
+    if (m_isNewObject && !(azrt && (updateFlags & UPDATEFLAG_SELF)))
         updatetype = UPDATETYPE_CREATE_OBJECT2;
 #else
     if (target->GetMover() == this)
         updateFlags |= UPDATEFLAG_SELF;
 #endif
 
-    //sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "BuildCreateUpdate: update-type: %u, object-type: %u got updateFlags: %X", updatetype, m_objectTypeId, updateFlags);
+    uint8 const wireTypeId = azrtBagAsItem ? uint8(TYPEID_ITEM) : m_objectTypeId;
 
     ByteBuffer& buf = data.AddUpdateBlockAndGetBuffer();
     buf << (uint8)updatetype;
@@ -344,7 +349,7 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
 #else
     buf << GetGUID();
 #endif
-    buf << uint8(m_objectTypeId);
+    buf << uint8(wireTypeId);
 
     BuildMovementUpdate(&buf, updateFlags);
 
@@ -370,8 +375,22 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
 #endif
 
     UpdateMask updateMask;
-    updateMask.SetCount(m_valuesCount);
-    _SetCreateBits(updateMask, target);
+    uint16 const createLimit = azrtBagAsItem ? uint16(ITEM_END) : m_valuesCount;
+    updateMask.SetCount(createLimit);
+    _SetCreateBits(updateMask, target, createLimit);
+    if (azrt && GetTypeId() == TYPEID_PLAYER)
+    {
+        // Official self-CREATE (azrt-spawn-1fc-02): no UNIT_FIELD_AURA* and
+        // UNIT_FIELD_BYTES_1 omitted. Warrior Battle Stance writes form=17 and
+        // aura 2457; Emberveil then skips AzerothCharacter spawn. Male gender
+        // leaves PLAYER_BYTES_3=0, which _SetCreateBits would also omit.
+        for (uint16 i = UNIT_FIELD_AURA; i <= UNIT_FIELD_AURASTATE; ++i)
+            updateMask.UnsetBit(i);
+        updateMask.UnsetBit(UNIT_FIELD_BYTES_1);
+        updateMask.SetBit(PLAYER_BYTES);
+        updateMask.SetBit(PLAYER_BYTES_2);
+        updateMask.SetBit(PLAYER_BYTES_3);
+    }
     BuildValuesUpdate(updatetype, &buf, &updateMask, target);
 }
 
@@ -519,6 +538,14 @@ void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags) const
             m.stime = WorldTimer::getMSTime() + 1000;
             m.ChangePosition(wobject->GetPositionX(), wobject->GetPositionY(), wobject->GetPositionZ(), wobject->GetOrientation());
         }
+        // Official self-CREATE: player moveFlags are 0 (standing). Spline/root on
+        // login desyncs Emberveil's TYPEID_PLAYER visual spawn.
+        if ((updateFlags & UPDATEFLAG_SELF) && unit->IsPlayer())
+        {
+            if (Player const* self = unit->ToPlayer())
+                if (self->GetSession() && self->GetSession()->GetPlatform() == CLIENT_PLATFORM_X64)
+                    m.moveFlags = MOVEFLAG_NONE;
+        }
         if (unit->ToCreature())
             m.moveFlags = m.moveFlags & ~MOVEFLAG_ROOT;
         *data << m;
@@ -532,7 +559,7 @@ void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags) const
             *data << float(unit->GetSpeed(MOVE_SWIM_BACK));
             *data << float(unit->GetSpeed(MOVE_TURN_RATE));
             // Send current movement informations
-            if (unit->m_movementInfo.moveFlags & MOVEFLAG_SPLINE_ENABLED)
+            if (m.moveFlags & MOVEFLAG_SPLINE_ENABLED)
                 Movement::PacketBuilder::WriteCreate(*(unit->movespline), *data);
         }
         else
@@ -687,7 +714,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
         target->m_visibleGobjQuestActivated[GetObjectGuid()] = IsActivateToQuest;
     }
 
-    MANGOS_ASSERT(updateMask && updateMask->GetCount() == m_valuesCount);
+    MANGOS_ASSERT(updateMask && updateMask->GetCount() <= m_valuesCount);
 
     *data << (uint8)updateMask->GetBlockCount();
     data->append(updateMask->GetMask(), updateMask->GetLength());
@@ -992,12 +1019,17 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
 #endif
     else                                                    // other objects case (no special index checks)
     {
-        for (uint16 index = 0; index < m_valuesCount; ++index)
+        bool const azrtBagAsItem = GetTypeId() == TYPEID_CONTAINER
+            && target->GetSession() && target->GetSession()->GetPlatform() == CLIENT_PLATFORM_X64;
+        uint16 const valueLimit = updateMask->GetCount();
+        for (uint16 index = 0; index < valueLimit; ++index)
         {
             if (updateMask->GetBit(index))
             {
-                // send in current format (float as float, uint32 as uint32)
-                *data << m_uint32Values[index];
+                uint32 value = m_uint32Values[index];
+                if (azrtBagAsItem && index == OBJECT_FIELD_TYPE)
+                    value = TYPEMASK_OBJECT | TYPEMASK_ITEM;
+                *data << value;
             }
         }
     }
@@ -1138,14 +1170,16 @@ void Object::_SetUpdateBits(UpdateMask& updateMask, Player const* target) const
     }
 }
 
-void Object::_SetCreateBits(UpdateMask& updateMask, Player const* target) const
+void Object::_SetCreateBits(UpdateMask& updateMask, Player const* target, uint16 valueLimit) const
 {
     uint16 const* flags = nullptr;
     uint16 visibleFlag = GetUpdateFieldFlagsForTarget(target, flags);
     ASSERT(flags);
-    bool const* guidFieldStart = UpdateFields::GetGuidFieldStartArray(GetTypeId());
+    uint16 const limit = valueLimit && valueLimit < m_valuesCount ? valueLimit : m_valuesCount;
+    bool const* guidFieldStart = UpdateFields::GetGuidFieldStartArray(
+        (GetTypeId() == TYPEID_CONTAINER && limit == ITEM_END) ? TYPEID_ITEM : GetTypeId());
 
-    for (uint16 index = 0; index < m_valuesCount; ++index)
+    for (uint16 index = 0; index < limit; ++index)
     {
         if (!(flags[index] & visibleFlag))
             continue;

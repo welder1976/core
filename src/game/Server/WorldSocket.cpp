@@ -44,6 +44,7 @@
 #include "ObjectMgr.h"
 #include "ObjectGuid.h"
 #include "Player.h"
+#include "MovementInfo.h"
 
 #include "IO/Networking/DNS.h"
 #include "IO/Timer/AsyncSystemTimer.h"
@@ -141,7 +142,7 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
     uint16 const opcode = packet.GetOpcode();
     size_t const size = packet.size();
 
-    // Official after SET_ACTIVE_MOVER / 0x200: empty notify CMSG (no dedicated SMSG).
+    // Official after 0x1FC / 0x200: empty notify CMSG (no dedicated SMSG).
     // Next server packets are VALUES 0x1FC + 0x172 — not CHAR_ENUM / CHAR_CREATE.
     if (size == 0 && (opcode == 0x42B || opcode == 0x416 || opcode == 0x4C2 ||
                       opcode == 0x92 || opcode == 0x500))
@@ -171,8 +172,11 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
         return false; // consumed
     }
 
-    // Official Frida 1:1 counts: 0x143↔0x04F(GO), 0x0DE↔0x509(creature), 0x05D↔0x294(item).
-    // Do not pick type by entry DB lookup — collisions remap the wrong query.
+    // Live enter (Server.log): 0x5D = creature 3098/3143/…, 0xDE = equipped
+    // items 139/140/12282 (entry+guid, 12 bytes). Frida had these inverted.
+    // Forcing 0xDE → creature sent 0x509 fail (entry|0x80000000) so the
+    // player mesh never got item DisplayInfo. Do not dispatch by DB lookup:
+    // creature 139 can exist and would keep the same fail.
     if ((opcode == 0x5D || opcode == 0x143 || opcode == 0xDE) && size >= 4)
     {
         uint32 entry = 0;
@@ -180,10 +184,10 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
         uint16 mapped = CMSG_ITEM_QUERY_SINGLE;
         if (opcode == 0x143)
             mapped = CMSG_GAMEOBJECT_QUERY;
-        else if (opcode == 0xDE)
+        else if (opcode == 0x5D)
             mapped = CMSG_CREATURE_QUERY;
         else
-            mapped = CMSG_ITEM_QUERY_SINGLE; // 0x5D
+            mapped = CMSG_ITEM_QUERY_SINGLE; // 0xDE
         packet.SetOpcode(mapped);
         packet.rpos(0);
         sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
@@ -192,14 +196,29 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
         return true;
     }
 
-    // Same writer as 0x159 (1411a0ee0, raw 8-byte guid).
+    // Emberveil 0x11 is CMSG_SET_ACTIVE_MOVER (3.3.5-style: after local player
+    // CREATE in 0x1FC, client names the guid it now controls). Player guid →
+    // classic handler (GetConfirmedMover). Creature guid is NPC walk/possess
+    // notify — do not swap the player's mover onto that.
     if (opcode == 0x11 && size == 8)
     {
-        packet.SetOpcode(CMSG_SET_ACTIVE_MOVER);
+        ObjectGuid guid;
         packet.rpos(0);
-        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                 "WorldSocket: AZRT 0x11 -> CMSG_SET_ACTIVE_MOVER");
-        return true;
+        packet >> guid;
+        if (guid.IsPlayer())
+        {
+            packet.Initialize(CMSG_SET_ACTIVE_MOVER, 8);
+            packet << guid;
+            packet.rpos(0);
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                     "WorldSocket: AZRT 0x11 -> CMSG_SET_ACTIVE_MOVER %s",
+                     guid.GetString().c_str());
+            return true;
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                 "WorldSocket: AZRT 0x11 NPC-walk notify guid=%s (consumed)",
+                 guid.GetString().c_str());
+        return false;
     }
 
     if (opcode == 0x159 && size == 8)
@@ -264,26 +283,40 @@ bool AzrtRemapInWorldCmsg(WorldPacket& packet, WorldSession* session)
     }
 
     // Movement family: shared sender 0x1449673E0, size always 0x50,
-    // serialize 0x1446651D0 (u32s + u64 at +0x20). Official 0x3CD etc.
-    // Do not queue as classic MSG_MOVE_* (packed guid layout).
+    // serialize 0x1446651D0 (u32 flags/time + xyz o + u64 at +0x20).
+    // Opcode is the move type (0x3CD heartbeat, start/stop, …). Rewrite to
+    // classic MSG_MOVE_HEARTBEAT so HandleMovementOpcodes can relocate.
     if (size == 80)
     {
-        uint32 f0 = 0, f1 = 0, f2 = 0;
+        uint32 flags = 0, ctime = 0, extra = 0;
         float x = 0, y = 0, z = 0, o = 0;
         uint64 tguid = 0;
-        memcpy(&f0, packet.contents() + 0x00, 4);
-        memcpy(&f1, packet.contents() + 0x04, 4);
-        memcpy(&f2, packet.contents() + 0x08, 4);
+        memcpy(&flags, packet.contents() + 0x00, 4);
+        memcpy(&ctime, packet.contents() + 0x04, 4);
+        memcpy(&extra, packet.contents() + 0x08, 4);
         memcpy(&x, packet.contents() + 0x0C, 4);
         memcpy(&y, packet.contents() + 0x10, 4);
         memcpy(&z, packet.contents() + 0x14, 4);
         memcpy(&o, packet.contents() + 0x18, 4);
         memcpy(&tguid, packet.contents() + 0x20, 8);
-        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                 "WorldSocket: AZRT MOVE80 opcode=0x%X u32=%u,%u,%u xyz=(%f,%f,%f) o=%f tguid=%s",
-                 uint32(opcode), f0, f1, f2, x, y, z, o,
+
+        flags &= ~(MOVEFLAG_ONTRANSPORT | MOVEFLAG_SWIMMING |
+                   MOVEFLAG_JUMPING | MOVEFLAG_SPLINE_ELEVATION);
+
+        MovementInfo mi;
+        mi.moveFlags = flags;
+        mi.ctime = ctime;
+        mi.stime = ctime;
+        mi.ChangePosition(x, y, z, o);
+
+        packet.Initialize(MSG_MOVE_HEARTBEAT, 32);
+        mi.Write(packet);
+        packet.rpos(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_DETAIL,
+                 "WorldSocket: AZRT MOVE80 0x%X -> HEARTBEAT flags=%u time=%u xyz=(%.2f,%.2f,%.2f) o=%.2f extra=%u tguid=%s",
+                 uint32(opcode), flags, ctime, x, y, z, o, extra,
                  ObjectGuid(tguid).GetString().c_str());
-        return false;
+        return true;
     }
 
     // u32 payload. HandleZoneUpdateOpcode ignores the value and uses server position.
@@ -609,13 +642,13 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                     //   0x299 -> CMSG_CHAR_CREATE
                     //   0x221 -> CMSG_CHAR_DELETE
                     //   0x4EE -> CMSG_PLAYER_LOGIN — u64 guid + CString locale
-                    //   0x011 -> CMSG_SET_ACTIVE_MOVER (8B guid)
+                    //   0x011 -> SET_ACTIVE_MOVER if player guid; NPC guid consumed
                     //   0x159 / 0x47E -> CMSG_SET_SELECTION (8B guid)
                     //   0x256 -> CMSG_GOSSIP_HELLO / CMSG_GAMEOBJ_USE
                     //   0x4C4 -> CMSG_NPC_TEXT_QUERY (u32 + guid)
                     //   0x287 / 0x264 -> CMSG_QUESTGIVER_QUERY_QUEST (guid + u32)
                     //   0x74 -> CMSG_GOSSIP_SELECT_OPTION
-                    //   size=80 -> movement family (drop; log xyz)
+                    //   size=80 -> MSG_MOVE_HEARTBEAT (xyz from Emberveil block)
                     //   0x1AB -> CMSG_ZONEUPDATE (u32)
                     //   0x4FB / 0x5D / 0x143 / 0xDE -> name/creature/GO/item query
                     // Unmapped in-world CMSG are dropped (numbers collide with classic SMSG).
@@ -623,17 +656,11 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                     {
                         if (opcode == 0x60 && packet->size() == 0)
                         {
-                            // Official also emits empty 0x60 after enter-world (HUD init).
-                            // Answering with 0x478 CHAR_ENUM while in-world unloads the map.
-                            Player* plr = m_Session->GetPlayer();
-                            if (plr && plr->IsInWorld())
-                            {
-                                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                                         "WorldSocket: AZRT 0x60 in-world (not CHAR_ENUM)");
-                                return HandlerResult::Okay;
-                            }
+                            // Official sniff: empty 0x60 after 0x200 is still CHAR_ENUM
+                            // (SMSG 0x478). Swallowing it left HUD/pawn unbound.
                             sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                                     "WorldSocket: AZRT 0x60 -> CMSG_CHAR_ENUM");
+                                     "WorldSocket: AZRT 0x60 -> CMSG_CHAR_ENUM inWorld=%u",
+                                     (m_Session->GetPlayer() && m_Session->GetPlayer()->IsInWorld()) ? 1u : 0u);
                             m_Session->HandleCharEnumOpcode(NullClientPacket(CMSG_CHAR_ENUM));
                             return HandlerResult::Okay;
                         }
@@ -664,8 +691,9 @@ WorldSocket::HandlerResult WorldSocket::_HandleCompleteReceivedPacket(std::uniqu
                         if (opcode == 0x299)
                         {
                             // Emberveil CMSG 0x299 — not classic CMSG_CHAR_CREATE (54).
-                            // Body: UTF-8 CString name + 9×u8 appearance. Do not queue
-                            // the wire opcode through the 1.12 reader.
+                            // UOA WorldPipe::trimClientBody: name cstring + 9 appearance
+                            // bytes; anything past that is padding the vanilla server
+                            // rejects. Read the vanilla prefix and drop the rest.
                             try
                             {
                                 auto create = std::make_unique<WorldPackets::Character::CharCreate>();

@@ -315,7 +315,7 @@ void WorldSession::HandleMovementOpcodes(WorldPackets::Movement::MovementPacket 
     if (!VerifyMovementInfo(packet.movementInfo))
         return;
 
-    if (pPlayerMover)
+    if (pPlayerMover && GetPlatform() != CLIENT_PLATFORM_X64)
     {
         if ((m_moveRejectTime = _player->GetCheatData()->HandleFlagTests(pPlayerMover, const_cast<MovementInfo&>(packet.movementInfo), opcode)) ||
             (m_moveRejectTime = _player->GetCheatData()->HandlePositionTests(pPlayerMover, const_cast<MovementInfo&>(packet.movementInfo), opcode)))
@@ -850,9 +850,6 @@ void WorldSession::HandleMoveSplineDoneOpcode(WorldPackets::Movement::MoveSpline
 
 void WorldSession::HandleSetActiveMoverOpcode(WorldPackets::Misc::SetActiveMover const& packet)
 {
-    if (GetPlatform() == CLIENT_PLATFORM_X64 && m_azrtDeferWorldStates)
-        AzrtFlushWorldAfterMover();
-
     if (!packet.guid.IsEmpty())
     {
         Unit* pMover = _player->GetMover();
@@ -861,6 +858,8 @@ void WorldSession::HandleSetActiveMoverOpcode(WorldPackets::Misc::SetActiveMover
             sLog.Player(this, LOG_MOVEMENT, LOG_LVL_ERROR, "HandleSetActiveMover: Incorrect mover guid. Mover is %s and should be %s.",
                 pMover->GetGuidStr().c_str(), packet.guid.GetString().c_str());
             m_clientMoverGuid = pMover->GetObjectGuid();
+            if (GetPlatform() == CLIENT_PLATFORM_X64)
+                AzrtFlushWorldAfterMover();
             return;
         }
 
@@ -891,6 +890,8 @@ void WorldSession::HandleSetActiveMoverOpcode(WorldPackets::Misc::SetActiveMover
     }
 
     m_clientMoverGuid = packet.guid;
+    if (GetPlatform() == CLIENT_PLATFORM_X64)
+        AzrtFlushWorldAfterMover();
 }
 
 void WorldSession::HandleMoveNotActiveMoverOpcode(WorldPackets::Movement::MoveNotActiveMover const& packet)

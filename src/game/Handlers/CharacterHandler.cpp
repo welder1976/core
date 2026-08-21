@@ -178,7 +178,9 @@ void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
                 m_characterMaxLevel = level;
 
             sLog.Out(LOG_BASIC, LOG_LVL_DETAIL, "Build enum data for char guid %u from account %u.", guidlow, GetAccountId());
-            // UOA: client speaks vanilla 1.12 char-list body; only C->S opcodes are renumbered.
+            // Unreal-Open-Azeroth WorldPipe::reshapeCharEnum: vanilla 1.12 body
+            // (displayId+inventoryType × 20 slots, no per-slot enchant), then a
+            // 32-byte AZCT slot-1 trailer is appended below.
             if (Player::BuildEnumData(result, &data, false))
                 ++num;
         }
@@ -194,6 +196,10 @@ void WorldSession::HandleCharEnum(std::unique_ptr<QueryResult> result)
     // (0x271 is scene-load; UOA default 0x3B matches mangos wire, not this client's table.)
     if (azrt)
     {
+        // Official: 0x527 once, then CHAR_ENUM. Repeating it on the second
+        // 0x60 / before VERIFY is not in the sniff.
+        if (!HasAzrtCharEnumFullBeenSent())
+            AzrtSendWorldAccess();
         data.SetOpcode(AzrtOpcode::CHAR_ENUM);
         MarkAzrtCharEnumFullSent();
 

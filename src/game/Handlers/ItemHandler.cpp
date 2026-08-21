@@ -309,6 +309,10 @@ void WorldSession::HandleItemQuerySingleOpcode(WorldPackets::Item::QueryItem con
         data << uint32(pProto->InventoryType);
         data << uint8(0);
         data << uint8(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "WorldSession: AZRT 0x294 ITEM_QUERY entry=%u display=%u invType=%u size=%u",
+                 pProto->ItemId, pProto->DisplayInfoID, pProto->InventoryType,
+                 uint32(data.size()));
         SendPacket(&data);
         return;
     }

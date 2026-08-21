@@ -3,9 +3,10 @@
  *
  * Adapted from Unreal-Open-Azeroth OpcodeMap.h / WorldPipe.cpp, then
  * aligned to Emberveil's runtime Register map (WorldVerifyProbe, RVA
- * 0x495E430). The DLL talks to stock mangos and invents 0x527; we do not —
- * official enter-world is 0xC5 VERIFY, then CMSG 0x103, then 0x28E/0x1FC.
- * 0x102 is registered (shared stub-like 0x4956130) but is not a pawn spawn.
+ * 0x495E430). UOA talks to stock mangos and stops at char-select; we keep
+ * their remap (0x478 enum, 0x232/0x233 create/delete) and speak the rest
+ * natively. Official enter: 0x527 access, 0xC5 VERIFY, CMSG 0x103,
+ * 0x28E/0x1FC. No 0x102. Player spawn is the first 0x1FC CREATE.
  */
 
 #ifndef MANGOS_AZRT_OPCODE_MAP_H
@@ -37,7 +38,8 @@ namespace AzrtOpcode
         GAMEOBJECT_QUERY    = 0x04F,
         ITEM_QUERY          = 0x294,
         GOSSIP_MESSAGE      = 0x0A0,
-        QUERY_NAME          = 0x3CC  // official 0x4FB reply
+        QUERY_NAME          = 0x3CC, // official 0x4FB reply
+        WORLD_ACCESS        = 0x527  // official sniff 1319: 01 00 00 00 00
     };
 
     // Emberveil C->S (WorldSocket remaps). Auth/ping keep classic numbers.
@@ -48,13 +50,13 @@ namespace AzrtOpcode
         CMSG_CHAR_CREATE       = 0x299,
         CMSG_CHAR_DELETE       = 0x221,
         CMSG_PLAYER_LOGIN      = 0x4EE,
-        CMSG_SET_MOVER         = 0x011,
+        CMSG_SET_MOVER         = 0x011, // after local-player CREATE: take control (NPC guid = walk notify)
         CMSG_SET_SELECTION     = 0x159,
         CMSG_ZONEUPDATE        = 0x1AB,
         CMSG_WORLD_READY       = 0x103, // ack after 0xC5; not forwarded as SMSG_EMOTE
         CMSG_QUERY_BY_GUID     = 0x4FB,
-        CMSG_CREATURE_QUERY    = 0x0DE,
-        CMSG_ITEM_QUERY        = 0x05D,
+        CMSG_CREATURE_QUERY    = 0x05D, // live: 3098/3143/… (Frida had this inverted)
+        CMSG_ITEM_QUERY        = 0x0DE, // live: equipped 139/140/12282
         CMSG_GAMEOBJECT_QUERY  = 0x143
     };
 
@@ -168,7 +170,7 @@ namespace AzrtOpcode
             case 0x4E1: case 0x4E2: case 0x4E6: case 0x4EA: case 0x4EC: case 0x4ED: case 0x4EF: case 0x4F0:
             case 0x4F1: case 0x4F3: case 0x4FA: case 0x4FE: case 0x502: case 0x503: case 0x509: case 0x50F:
             case 0x510: case 0x511: case 0x517: case 0x519: case 0x51D: case 0x51F: case 0x520: case 0x521:
-            case 0x523: case 0x525:
+            case 0x523: case 0x525: case 0x527:
                 return true;
             default:
                 return false;

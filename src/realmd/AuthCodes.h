@@ -48,6 +48,13 @@ enum eAuthCmd : uint8
     CMD_AUTH_AZRT_CHALLENGE_RESP      = 0xA1,
     CMD_AUTH_AZRT_LOGON_PROOF         = 0xA2,
     CMD_AUTH_AZRT_PROOF_RESP          = 0xA3,
+    // Unreal-Open-Azeroth AuthProxy: after A3 the client may emit these with a
+    // uint16 size prefix (same framing as B0). No reply — consume and continue.
+    CMD_AUTH_AZRT_TICKET              = 0xA5, // S->C (unused; we skip the handshake)
+    CMD_AUTH_AZRT_KEY_ACK             = 0xA6, // C->S key-ack
+    CMD_AUTH_AZRT_SESSION             = 0xA7, // S->C
+    CMD_AUTH_AZRT_KEY_INSTALL         = 0xA8, // S->C
+    CMD_AUTH_AZRT_KEY_INSTALL_ACK     = 0xA9, // C->S, 58 bytes on the wire
     // Realm list follows the same req/resp pairing as challenge/proof (A0→A1, A2→A3).
     CMD_AUTH_AZRT_REALM_LIST          = 0xB0, // client request
     CMD_AUTH_AZRT_REALM_LIST_RESP     = 0xB1, // server response

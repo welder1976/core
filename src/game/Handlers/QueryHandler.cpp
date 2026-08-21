@@ -116,8 +116,17 @@ void WorldSession::HandleCreatureQueryOpcode(WorldPackets::Query::QueryCreature 
     CreatureInfo const* ci = sObjectMgr.GetCreatureTemplate(packet.entry);
     if (GetPlatform() == CLIENT_PLATFORM_X64)
     {
-        // Official Emberveil 0x509 @ 0x14494E520:
-        //   entry, type, displayId, name\0, u8×3, u32×31, subname\0, u32×14
+        // Official Emberveil 0x509 handler 0x14494F540 (not 0x14494E520):
+        //   u32 entry, u32 type, u32 displayId, cstr name, u8×3,
+        //   u32×20,
+        //   (u32×2)×10,          // 0x1412567E0
+        //   (u32×3)×5,           // 0x1446650C0
+        //   u32×10,
+        //   (u32×6)×5,           // 0x143E4FA20
+        //   u32,
+        //   cstr subname,
+        //   u32×14
+        // Middle block is 96×u32. Too few bytes hit 0x141298B70 and close the client.
         WorldPacket data(SMSG_CREATURE_QUERY_RESPONSE);
         if (!ci)
         {
@@ -142,7 +151,6 @@ void WorldSession::HandleCreatureQueryOpcode(WorldPackets::Query::QueryCreature 
         data << uint8(ci->civilian);
         data << uint8(ci->racial_leader);
         data << uint8(0);
-        // Official parser @ 0x14494E520: after name/u8×3 expects u32×31, cstr, u32×14.
         data << uint32(ci->static_flags1);
         data << uint32(ci->pet_family);
         data << uint32(ci->rank);
@@ -150,7 +158,7 @@ void WorldSession::HandleCreatureQueryOpcode(WorldPackets::Query::QueryCreature 
         data << uint32(ci->pet_spell_list_id);
         for (uint32 i = 1; i < MAX_DISPLAY_IDS_PER_CREATURE; ++i)
             data << uint32(ci->display_id[i]);
-        for (uint32 i = 0; i < 23; ++i) // 5+3+23 = 31
+        for (uint32 i = 8; i < 96; ++i)
             data << uint32(0);
         {
             std::string const* subName = &ci->subname;
@@ -166,6 +174,9 @@ void WorldSession::HandleCreatureQueryOpcode(WorldPackets::Query::QueryCreature 
         }
         for (uint32 i = 0; i < 14; ++i)
             data << uint32(0);
+        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                 "AZRT 0x509 creature query entry=%u display=%u size=%u",
+                 ci->entry, ci->display_id[0], uint32(data.size()));
         SendPacket(&data);
         return;
     }

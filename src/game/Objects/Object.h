@@ -415,7 +415,7 @@ class Object
         void _Create (uint32 guidlow, uint32 entry, HighGuid guidhigh);
 
         uint16 GetUpdateFieldFlagsForTarget(Player const* target, uint16 const*& flags) const;
-        void _SetCreateBits(UpdateMask& updateMask, Player const* target) const;
+        void _SetCreateBits(UpdateMask& updateMask, Player const* target, uint16 valueLimit = 0) const;
         void _SetUpdateBits(UpdateMask& updateMask, Player const* target) const;
         void _LoadIntoDataField(std::string const& data, uint32 startOffset, uint32 count);
 

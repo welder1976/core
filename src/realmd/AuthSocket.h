@@ -70,6 +70,8 @@ class AuthSocket : public std::enable_shared_from_this<AuthSocket>, MaNGOS::Poli
         void _HandleReconnectChallenge();
         void _HandleReconnectProof();
         void _HandleRealmList();
+        // Unreal-Open-Azeroth: ignore A6/A9 (size-prefixed) after AZRT proof.
+        void _HandleAzrtIgnore();
 
         //data transfer handle for patch
         void _HandleXferAccept();

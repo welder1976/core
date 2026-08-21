@@ -422,11 +422,13 @@ class WorldSession
         void SendAccountDataTimes();
         // Emberveil: after CMSG 0x103 continue login (official TXT order).
         void AzrtContinueEnterWorld();
-        // Official: 0x200/0x172 after CMSG 0x11, not in the same burst as 0x1FC.
+        // Official: 0x200 then 0x172 after CMSG 0x11 (player guid), not after CREATE.
         void AzrtFlushWorldAfterMover();
         bool AzrtShouldDeferWorldStates() const { return m_azrtDeferWorldStates; }
         // Official 0x4FB → SMSG 0x3CC (guid + u32), not creature-query/0x509.
         void AzrtSendQueryName(ObjectGuid guid);
+        // Official sniff SMSG 1319 before CHAR_ENUM: u8=1, u32=0. Lifts pawn possess.
+        void AzrtSendWorldAccess();
         void LoadGlobalAccountData();
         void LoadAccountData(std::unique_ptr<QueryResult> result, uint32 mask);
 

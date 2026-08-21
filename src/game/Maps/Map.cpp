@@ -429,6 +429,8 @@ bool Map::Add(Player* player)
     // so that closed doors are closed when the player appears.
     // Send init first    => Can walk through doors at login
     // Send objects first => Can not take quests at relogin
+    // Official Emberveil first 0x1FC: hasTransport=1, CREATE TYPEID_GAMEOBJECT
+    // (MO_TRANSPORT). Second 0x1FC: items + player. Same order as vanilla.
     SendInitTransports(player);
     SendInitSelf(player);
     // Clear m_visibleGUIDs in case 2 players entered a map at the same time,

@@ -4202,12 +4202,8 @@ void Player::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
 {
     if (target == this)
     {
-        // Emberveil 0x1FC parser desyncs on ITEM creates (field mask). Skip items
-        // for the self packet only — nearby UNIT/GO creates are a separate update.
-        bool const azrtSelf = target->GetSession() &&
-            target->GetSession()->GetPlatform() == CLIENT_PLATFORM_X64;
-        if (!azrtSelf)
-        {
+        bool const azrt = GetSession() && GetSession()->GetPlatform() == CLIENT_PLATFORM_X64;
+        int const bagEnd = azrt ? INVENTORY_SLOT_ITEM_END : BANK_SLOT_BAG_END;
         for (int i = 0; i < EQUIPMENT_SLOT_END; ++i)
         {
             if (m_items[i] == nullptr)
@@ -4215,13 +4211,15 @@ void Player::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
 
             m_items[i]->BuildCreateUpdateBlockForPlayer(data, target);
         }
-        for (int i = INVENTORY_SLOT_BAG_START; i < BANK_SLOT_BAG_END; ++i)
+        for (int i = INVENTORY_SLOT_BAG_START; i < bagEnd; ++i)
         {
             if (m_items[i] == nullptr)
                 continue;
 
             m_items[i]->BuildCreateUpdateBlockForPlayer(data, target);
         }
+        if (!azrt)
+        {
 #if SUPPORTED_CLIENT_BUILD > CLIENT_BUILD_1_7_1
         for (int i = BUYBACK_SLOT_START; i < BUYBACK_SLOT_END; ++i)
         {
@@ -8229,7 +8227,7 @@ static WorldStatePair def_world_states[] =
 
 void Player::SendInitWorldStates(uint32 zoneid) const
 {
-    // Emberveil: official 0x200 is after CMSG 0x11, not in the create-0x1FC burst.
+    // Emberveil: keep 0x200 out of the create-0x1FC burst; flush after CMSG 0x11.
     if (GetSession() && GetSession()->AzrtShouldDeferWorldStates())
         return;
 
